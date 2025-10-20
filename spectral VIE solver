@@ -1,0 +1,242 @@
+% 2D Elastic VTI, frequency-domain, spectral VIE (matrix-free)
+% Matches PDE spectral method's ABL via complex density (identical sponge)
+% Figures produced:
+%   (1) Total displacement magnitudes (|Re(Ux)|, |Im(Ux)|, |Re(Uz)|, |Im(Uz)|) — VIE layout
+%   (2) GMRES convergence — VIE layout
+%
+% Unknowns: displacement u = [u_x, u_z]
+% Lippmann–Schwinger form with isotropic FFT Green's tensor:
+%   u - G0 * [ ω^2 Δρ u + ∇·(ΔC : ε(u)) ] = u0,  where u0 = G0 * f
+% ABL: complex density ρ_eff = ρ + i*sign_t*η_ρ, identical to PDE script
+% Developer: Morten Jakobsen
+% Date: 20 October 2025
+% NB Working Nicely
+
+clear; clc; close all; warning off
+
+%% ----------------------- USER SETTINGS (ABL-MATCHED) --------------------
+dx = 10; dz = 10;
+Nx = 801; Nz = 801;                % odd -> center source
+f_hz = 5.0;                        % 5 Hz (matches PDE and prior VIE script)
+omega = 2*pi*f_hz;
+timeConvention = 'em1';            % 'em1' (e^{-i ω t}) or 'ep1' (e^{+i ω t})
+sign_t = +1; if strcmpi(timeConvention,'ep1'), sign_t = -1; end
+
+% Isotropic reference (Green's tensor) — same as PDE preconditioner/reference
+rho_ref = 2500; Vp_ref = 3000; Vs_ref = 1500;
+
+% 3-layer VTI (laterally invariant along x)
+z1 = 500; z2 = 1200;
+rho1=2200; Vp01=2800; Vs01=1600; eps1=0.0; del1=0.0; gam1=0.0;
+rho2=2200; Vp02=2800; Vs02=1600; eps2=0.0; del2=0.0; gam2=0.0;
+rho3=2200; Vp03=2800; Vs03=1600; eps3=0.0; del3=0.0; gam3=0.0;
+
+% Source: x-directed point force at center (pol=[1,0])
+pol = [1, 0];    % [px, pz]
+
+% Sponge / ABL (complex density) — identical to PDE script
+abs_thickness_wl  = 4.0;    % thickness in S-wavelengths
+eta_max_factor    = 1.0;    % scales complex density amplitude
+eps_rel           = 1e-6;   % tiny uniform complex density (stability)
+
+% GMRES
+restart = 60; tol = 1e-6; maxit = 300;
+
+%% ---------------------------- GRID --------------------------------------
+xax = (0:Nx-1)*dx;
+zax = (0:Nz-1)*dz;
+[X, Z] = ndgrid(xax, zax);
+Lx = Nx*dx; Lz = Nz*dz;
+N = Nx*Nz;
+[KX, KZ] = build_k_grids(Nx, Nz, dx, dz);
+KK2 = KX.^2 + KZ.^2;
+
+%% ----------------------- BUILD 3-LAYER VTI MODEL ------------------------
+M1z = (zax <= z1);
+M2z = (zax > z1) & (zax <= z2);
+M3z = (zax > z2);
+M1  = ones(Nx,1) * double(M1z);
+M2  = ones(Nx,1) * double(M2z);
+M3  = ones(Nx,1) * double(M3z);
+
+[c11_1,c33_1,c55_1,c13_1] = thomsen_to_stiffness(rho1,Vp01,Vs01,eps1,del1,gam1);
+[c11_2,c33_2,c55_2,c13_2] = thomsen_to_stiffness(rho2,Vp02,Vs02,eps2,del2,gam2);
+[c11_3,c33_3,c55_3,c13_3] = thomsen_to_stiffness(rho3,Vp03,Vs03,eps3,del3,gam3);
+
+c11 = c11_1.*M1 + c11_2.*M2 + c11_3.*M3;
+c33 = c33_1.*M1 + c33_2.*M2 + c33_3.*M3;
+c55 = c55_1.*M1 + c55_2.*M2 + c55_3.*M3;
+c13 = c13_1.*M1 + c13_2.*M2 + c13_3.*M3;
+rho = rho1.*M1 + rho2.*M2 + rho3.*M3;
+
+% Vertical phase velocities (for ABL thickness only)
+Vp0_map = sqrt(max(c33,0)./max(rho,eps));
+Vs0_map = sqrt(max(c55,0)./max(rho,eps));
+Vs_min = min(Vs0_map(:));
+lambda_s_min = Vs_min / max(f_hz, eps);
+
+%% ------------------------------- SOURCE ---------------------------------
+sx = ceil((Nx+1)/2);
+sz = ceil((Nz+1)/2);
+S = zeros(Nx, Nz); S(sx, sz) = 1;
+fx = pol(1) * S;
+fz = pol(2) * S;
+
+%% ----------------------------- SPONGE/ABL -------------------------------
+thickness_m = abs_thickness_wl * lambda_s_min;
+[eta_profile, ~] = build_sponge_quadratic_with_t(Nx, Nz, Lx, Lz, thickness_m);  % eta_profile = tau.^2
+
+% Complex density amplitude (real ≥ 0), used as i*sign_t*eta_rho
+eta_rho = eta_max_factor * mean(rho(:)) * eta_profile + eps_rel * rho;  % kg/m^3
+rho_eff = rho + 1i * sign_t * eta_rho;
+
+%% ------------------------ PACK/UNPACK & OPERATORS -----------------------
+pack   = @(u1,u2) [u1(:); u2(:)];
+unpack = @(x) deal(reshape(x(1:N), Nx, Nz), reshape(x(N+1:2*N), Nx, Nz));
+
+% Isotropic reference (Green's tensor G0 = A0^{-1})
+rho0 = rho_ref;
+mu0  = rho_ref * Vs_ref^2;
+lambda0 = rho_ref * (Vp_ref^2 - 2*Vs_ref^2);
+rho0_eff = rho0 + 1i * sign_t * mean(eta_rho(:));  % same ABL flavor in reference
+
+% Build isotropic reference stiffness (Voigt, plane strain) as fields
+c11_0 = (lambda0 + 2*mu0) * ones(Nx, Nz);
+c33_0 = (lambda0 + 2*mu0) * ones(Nx, Nz);
+c55_0 = (mu0) * ones(Nx, Nz);
+c13_0 = (lambda0) * ones(Nx, Nz);
+
+% Contrasts relative to reference
+d_rho = rho_eff - rho0_eff;      % complex density contrast (includes ABL)
+d_c11 = c11 - c11_0;
+d_c33 = c33 - c33_0;
+d_c55 = c55 - c55_0;
+d_c13 = c13 - c13_0;
+
+% Green's tensor application (isotropic FFT inverse)
+G0_apply = @(r) applyMinv_isoFFT(r, Nx, Nz, KX, KZ, KK2, omega, rho0_eff, lambda0, mu0, pack, unpack);
+
+% Background field in reference medium: u0 = G0 * f
+b_forcing = pack(fx, fz);
+u0 = G0_apply(b_forcing);
+
+% Contrast operator: V(u) = ω^2 Δρ u + ∇·(Δσ(u)), Δσ = ΔC:ε(u)
+V_apply = @(x) applyV_contrast(x, Nx, Nz, KX, KZ, omega, d_rho, d_c11, d_c33, d_c55, d_c13, pack, unpack);
+
+% VIE System: (I - G0 V) u = u0
+Afun = @(x) x - G0_apply(V_apply(x));
+b = u0;
+
+%% -------------------------------- GMRES ---------------------------------
+x0 = zeros(2*N,1);
+% Note: No extra preconditioner here; G0 is embedded in the operator (I - G0 V)
+[xsol, flag, relres, iter, resvec] = gmres(Afun, b, restart, tol, maxit, [], [], x0);
+if numel(iter) == 2, total_iters = (iter(1)-1)*restart + iter(2); else, total_iters = iter; end
+[u1, u2] = unpack(xsol);
+
+%% ========================= VIE-STYLE FIGURES ============================
+
+% Main 2x2 figure: abs(real/imag) of Ux and Uz, VIE layout
+figure('Name','Total displacement magnitudes (x-directed force, 3-layer VTI, VIE)')
+colormap parula
+
+subplot(2,2,1)
+imagesc(xax, zax, abs(real(u1)).'); axis equal tight; set(gca,'YDir','normal')
+colorbar; title('|Re(U_x)|'); xlabel('X (m)'); ylabel('Z (m)')
+
+subplot(2,2,2)
+imagesc(xax, zax, abs(imag(u1)).'); axis equal tight; set(gca,'YDir','normal')
+colorbar; title('|Im(U_x)|'); xlabel('X (m)'); ylabel('Z (m)')
+
+subplot(2,2,3)
+imagesc(xax, zax, abs(real(u2)).'); axis equal tight; set(gca,'YDir','normal')
+colorbar; title('|Re(U_z)|'); xlabel('X (m)'); ylabel('Z (m)')
+
+subplot(2,2,4)
+imagesc(xax, zax, abs(imag(u2)).'); axis equal tight; set(gca,'YDir','normal')
+colorbar; title('|Im(U_z)|'); xlabel('X (m)'); ylabel('Z (m)')
+
+% GMRES Convergence (same normalization/labels as PDE)
+figure('Name','GMRES Convergence (VIE)');
+k = 0:numel(resvec)-1;
+if ~isempty(resvec) && resvec(1) ~= 0
+    semilogy(k, resvec/resvec(1), 'o-','LineWidth',1.2);
+else
+    semilogy(k, resvec/max(resvec(1),eps), 'o-','LineWidth',1.2);
+end
+grid on; hold on
+yline(tol,'r--','Tolerance');
+hold off
+xlabel('Iteration'); ylabel('||r_k|| / ||r_0||');
+title(sprintf('GMRES (I - G0V): flag=%d, relres=%.2e, total iters=%d (restart=%d)', flag, relres, total_iters, restart));
+
+%% ============================== FUNCTIONS ===============================
+function v = applyV_contrast(x, Nx, Nz, KX, KZ, omega, d_rho, d_c11, d_c33, d_c55, d_c13, pack, unpack)
+% V(u) = ω^2 Δρ u + ∇·(Δσ(u)), with Δσ = ΔC : ε(u)
+    [u1, u2] = unpack(x);
+    U1k = fft2(u1); U2k = fft2(u2);
+    du1dx = ifft2(1i*KX .* U1k); du1dz = ifft2(1i*KZ .* U1k);
+    du2dx = ifft2(1i*KX .* U2k); du2dz = ifft2(1i*KZ .* U2k);
+    e_xx = du1dx; e_zz = du2dz; g_xz = du2dx + du1dz;
+
+    % Δσ components (VTI contrast wrt isotropic reference)
+    ds_xx = d_c11 .* e_xx + d_c13 .* e_zz;
+    ds_zz = d_c13 .* e_xx + d_c33 .* e_zz;
+    ds_xz = d_c55 .* g_xz;
+
+    % Divergence of Δσ
+    DSxxk = fft2(ds_xx); DSzzk = fft2(ds_zz); DSxzk = fft2(ds_xz);
+    div1 = ifft2(1i*KX .* DSxxk + 1i*KZ .* DSxzk);
+    div2 = ifft2(1i*KX .* DSxzk + 1i*KZ .* DSzzk);
+
+    v1 = (omega^2) * d_rho .* u1 + div1;
+    v2 = (omega^2) * d_rho .* u2 + div2;
+    v = pack(v1, v2);
+end
+
+function z = applyMinv_isoFFT(r, Nx, Nz, KX, KZ, KK2, omega, rho0_eff, lambda0, mu0, pack, unpack)
+% Isotropic A0(k) = -ω^2 ρ0 I + μ0 k^2 I + (λ0+μ0) k k^T; A0^{-1} via projector formula
+    [r1, r2] = unpack(r);
+    R1 = fft2(r1); R2 = fft2(r2);
+    kx = KX; kz = KZ; k2 = KK2;
+    a = - (omega^2) * rho0_eff + mu0 * k2;
+    b = (lambda0 + mu0);
+    tiny = (1e-14)*(1+1i);
+    a_safe = a; mask = abs(a_safe) < 1e-14; a_safe(mask) = a_safe(mask) + tiny;
+    Rdot = kx .* R1 + kz .* R2;
+    denom = a_safe .* (a_safe + b * k2);
+    mask2 = abs(denom) < 1e-14; denom(mask2) = denom(mask2) + tiny;
+    coef = b ./ denom;
+    Z1_hat = (R1 ./ a_safe) - coef .* kx .* Rdot;
+    Z2_hat = (R2 ./ a_safe) - coef .* kz .* Rdot;
+    z = pack(ifft2(Z1_hat), ifft2(Z2_hat));
+end
+
+function [KX, KZ] = build_k_grids(Nx, Nz, dx, dz)
+    kx_vec = (2*pi/(Nx*dx)) * [0:ceil(Nx/2)-1, -floor(Nx/2):-1];
+    kz_vec = (2*pi/(Nz*dz)) * [0:ceil(Nz/2)-1, -floor(Nz/2):-1];
+    [KX, KZ] = ndgrid(kx_vec, kz_vec);
+end
+
+function [eta, tau] = build_sponge_quadratic_with_t(Nx, Nz, Lx, Lz, thickness_m)
+% tau: boundary ramp (0 in interior, 1 at boundary over thickness_m)
+% eta: quadratic sponge profile = tau.^2
+    x = (0:Nx-1) * (Lx/Nx);
+    z = (0:Nz-1) * (Lz/Nz);
+    [Xg, Zg] = ndgrid(x, z);
+    d_left = Xg; d_right = Lx - Xg; d_top = Zg; d_bottom = Lz - Zg;
+    dmin = min(min(d_left, d_right), min(d_top, d_bottom));
+    tau = max(0, min(1, (thickness_m - dmin) / max(thickness_m, eps)));
+    eta = tau.^2;
+end
+
+function [c11,c33,c55,c13] = thomsen_to_stiffness(rho,Vp0,Vs0,epsilon,delta,~)
+% Thomsen (VTI) to stiffness: c11,c33,c55,c13 (Voigt, engineering shear)
+% A=c11, C=c33, L=c55, F=c13; delta = ((F+L)^2 - (C-L)^2)/(2*C*(C-L))
+    A = rho*Vp0^2*(1 + 2*epsilon);
+    C = rho*Vp0^2;
+    L = rho*Vs0^2;
+    CL = C - L;
+    F = -L + sqrt(max(CL.*(CL + 2*C*delta), 0));
+    c11 = A; c33 = C; c55 = L; c13 = F;
+end
