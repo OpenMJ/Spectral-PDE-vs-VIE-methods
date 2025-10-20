@@ -1,0 +1,445 @@
+% 2D Elastic VTI Forward Modeling via Volume Integral Equation (GMRES)
+% Builds a 3-layer VTI model internally (no file I/O) and allows an
+% independent isotropic homogeneous reference medium for Green's function.
+% Produces Ux, Uz and plots |Re| and |Im| magnitudes plus GMRES convergence.
+%
+% Key points:
+% - 3-layer laterally invariant VTI model constructed from Thomsen params.
+% - Independent isotropic reference (rho_ref, Vp_ref, Vs_ref) for G0 and C0.
+% - Green's function without directional bias.
+% - Spectral derivatives (FFT) for strains and Green's function derivatives.
+% - Optional complex-density ABL + sponge T (recommended to avoid wrap-around).
+%
+% Author:  M. Jakobsen
+% Date: 18 Oct 2025
+
+clearvars; close all; clc; warning off
+tstart = tic;
+
+% ----------------------- USER SETTINGS -----------------------------------
+% Grid and frequency
+dx = 10;               % m
+dz = 10;               % m
+Nx = 201;              % choose odd to place source exactly at center
+Nz = 201;              % choose odd to place source exactly at center
+f_hz = 5.0;
+w = 2*pi*f_hz;
+
+% Independent isotropic reference medium (for G0 and reference tensor C0)
+rho_ref = 2500;        % kg/m^3
+Vp_ref  = 3000;        % m/s
+Vs_ref  = 1500;        % m/s
+alpha   = Vp_ref;      % ref Vp used in G0
+beta    = Vs_ref;      % ref Vs used in G0
+
+% 3-layer VTI model (laterally invariant)
+% Define interface depths (in meters, from top, increasing downward)
+z1 = 500;              % interface between Layer 1 and Layer 2
+z2 = 1200;             % interface between Layer 2 and Layer 3
+
+% Each layer is defined by Thomsen parameters relative to VTI with vertical symmetry axis:
+%   rho_i (kg/m^3), Vp0_i (m/s), Vs0_i (m/s), epsilon_i, delta_i, gamma_i
+% Choose small anisotropy for stability: |epsilon|,|delta|,|gamma| << 1
+% Layer 1
+rho1  = 2200;  Vp01 = 2800;  Vs01 = 1600;  eps1 = 0.0;  del1 = 0.0;  gam1 = 0.0;
+% Layer 2
+rho2  = 2200;  Vp02 = 2800;  Vs02 = 1600;  eps2 = 0.0;  del2 = 0.0;  gam2 = 0.0;
+% Layer 3
+rho3  = 2200;  Vp03 = 2800;  Vs03 = 1600;  eps3 = 0.0;  del3 = 0.0;  gam3 = 0.0;
+
+% Source: vertical point force
+source_x   = 'center';  % 'center' or integer index
+source_z   = 'center';  % 'center' or integer index
+pol        = [1,0];    % [px, pz] (vertical force)
+
+% Absorbing boundary and sponge
+abl_enable          = true;
+abl_thickness_frac  = 0.30;    % fraction of min(Nx,Nz) per side
+abl_profile         = 'sin2';
+abl_poly_order      = 2;
+abl_target_R        = 1e-8;
+abl_scale_by        = 'Vp';    % 'Vp' | 'Vs' | 'max' for ABL scaling
+abl_eta_clip        = [];
+sponge_enable       = true;
+tap_power           = 2;
+plot_abl_diagnostics = false;
+
+% GMRES
+gmres_tol     = 1e-6;
+gmres_maxit   = 300;
+gmres_restart = 40;
+
+% ----------------------- BUILD 3-LAYER VTI MODEL -------------------------
+% Grid coordinates (cell centers for plotting and layering)
+X = (0:Nx-1)*dx;
+Z = (0:Nz-1)*dz;
+
+% Depth masks per layer (1 x Nz), then expand to [Nx x Nz]
+M1z = (Z <= z1);
+M2z = (Z > z1) & (Z <= z2);
+M3z = (Z > z2);
+M1  = ones(Nx,1) * double(M1z);
+M2  = ones(Nx,1) * double(M2z);
+M3  = ones(Nx,1) * double(M3z);
+
+% Convert Thomsen parameters to stiffnesses for each layer (VTI: c11,c33,c55,c13)
+[c11_1,c33_1,c55_1,c13_1] = thomsen_to_stiffness(rho1,Vp01,Vs01,eps1,del1,gam1);
+[c11_2,c33_2,c55_2,c13_2] = thomsen_to_stiffness(rho2,Vp02,Vs02,eps2,del2,gam2);
+[c11_3,c33_3,c55_3,c13_3] = thomsen_to_stiffness(rho3,Vp03,Vs03,eps3,del3,gam3);
+
+% Assemble layer fields
+c11 = c11_1.*M1 + c11_2.*M2 + c11_3.*M3;
+c33 = c33_1.*M1 + c33_2.*M2 + c33_3.*M3;
+c55 = c55_1.*M1 + c55_2.*M2 + c55_3.*M3;
+c13 = c13_1.*M1 + c13_2.*M2 + c13_3.*M3;
+rho = rho1.*M1 + rho2.*M2 + rho3.*M3;
+
+dV = dx*dz;
+N  = Nx*Nz;
+
+% ----------------------- REFERENCE TENSOR (independent) ------------------
+c11_0 = rho_ref*alpha^2;
+c33_0 = c11_0;
+c55_0 = rho_ref*beta^2;
+c12_0 = c11_0 - 2*c55_0;  % isotropic reference (for operator and G0)
+
+C0 = [c11_0 c12_0 c12_0     0     0     0
+      c12_0 c11_0 c12_0     0     0     0
+      c12_0 c12_0 c11_0     0     0     0
+          0     0     0     c55_0 0     0
+          0     0     0     0     c55_0 0
+          0     0     0     0     0     c55_0];
+
+% ----------------------- ABL / SPONGE -----------------------------------
+if abl_enable
+    abl_thickness = max(1, round(abl_thickness_frac * min(Nx, Nz)));
+    [s_abl, m_mask] = build_abl_scale(Nx, Nz, abl_thickness, abl_profile);
+else
+    abl_thickness = 0;
+    s_abl = zeros(Nx, Nz);
+    m_mask = ones(Nx, Nz);
+end
+
+if sponge_enable
+    T = max(0, 1 - s_abl.^max(tap_power,1));
+else
+    T = ones(Nx, Nz);
+end
+
+if plot_abl_diagnostics
+    figure('Name','ABL diagnostics');
+    subplot(1,3,1); imagesc(X, Z, s_abl'); axis equal tight; colorbar
+    title('s\_abl'); xlabel('X (m)'); ylabel('Z (m)'); set(gca,'YDir','normal');
+    subplot(1,3,2); imagesc(X, Z, m_mask'); axis equal tight; colorbar
+    title('m\_mask'); xlabel('X (m)'); ylabel('Z (m)'); set(gca,'YDir','normal');
+    subplot(1,3,3); imagesc(X, Z, T'); axis equal tight; colorbar
+    title('T'); xlabel('X (m)'); ylabel('Z (m)'); set(gca,'YDir','normal'); drawnow
+end
+
+% ABL complex-density mapping
+c_ref = pick_c_ref(alpha, beta, abl_scale_by);
+d_abl = abl_thickness * dx;
+eta_max = compute_eta_max(w, d_abl, c_ref, abl_target_R, abl_poly_order);
+if ~isempty(abl_eta_clip), eta_max = min(eta_max, abl_eta_clip); end
+eta_map = eta_max * (s_abl .^ abl_poly_order);
+
+% ----------------------- CONTRASTS (times volume) -----------------------
+dc.dc11 = (c11 - C0(1,1)) .* dV;
+dc.dc33 = (c33 - C0(3,3)) .* dV;
+dc.dc55 = (c55 - C0(5,5)) .* dV;
+dc.dc13 = (c13 - C0(1,3)) .* dV;
+dc.drho = (rho - rho_ref) .* dV;
+
+% ----------------------- SOURCE -----------------------------------------
+% Place source (avoid ABL region if enabled)
+if ischar(source_x) && strcmpi(source_x,'center')
+    sx = ceil((Nx+1)/2);
+else
+    sx = max(1+abl_thickness, min(Nx-abl_thickness, round(source_x)));
+end
+if ischar(source_z) && strcmpi(source_z,'center')
+    sz = ceil((Nz+1)/2);
+else
+    sz = max(1+abl_thickness, min(Nz-abl_thickness, round(source_z)));
+end
+
+S = zeros(Nx, Nz);
+S(sx, sz) = 1;
+px = pol(1); pz = pol(2);
+S1 = px .* S;   % x-directed force
+S2 = pz .* S;   % z-directed force
+
+% ----------------------- OPTIONS -----------------------------------------
+opt.rho_0 = rho_ref;
+opt.c_0   = C0;
+opt.dx    = dx;
+opt.dz    = dz;
+opt.dV    = dV;
+opt.Nx    = Nx;
+opt.Nz    = Nz;
+opt.N     = N;
+opt.w     = w;
+opt.eta_map   = eta_map;
+opt.abl_sign  = -1;
+opt.T         = T;
+
+% Precompute spectral wavenumbers for base grid (Nx x Nz) for strain
+[opt.KX, opt.KZ] = build_k_grids(Nx, Nz, dx, dz);
+
+fprintf('Reference medium: rho0=%.1f kg/m^3, Vp0=%.1f m/s, Vs0=%.1f m/s\n', rho_ref, Vp_ref, Vs_ref);
+fprintf('Layer interfaces at z1=%.1f m, z2=%.1f m; source at (ix=%d, iz=%d)\n', z1, z2, sx, sz);
+
+% ----------------------- GREEN'S FUNCTION (2D) --------------------------
+[g0_11, g0_12, g0_21, g0_22] = build_G0_2D_vectorized(Nx, Nz, dx, dz, w, alpha, beta, rho_ref, dV);
+
+% Fourier-domain Green's tensor on doubled grid
+Green.G0_11 = fft2(g0_11);
+Green.G0_12 = fft2(g0_12);
+Green.G0_21 = fft2(g0_21);
+Green.G0_22 = fft2(g0_22);
+opt.Fshape = size(Green.G0_11);
+
+% Precompute spectral wavenumbers for doubled grid (2Nx x 2Nz) for H0 kernels
+[opt.KX_pad, opt.KZ_pad] = build_k_grids(opt.Fshape(1), opt.Fshape(2), dx, dz);
+
+% Spectral derivatives for H0 kernels (replaces FD-based GRAD)
+Green.H0_11 = -1i * (opt.KX_pad .* Green.G0_11);
+Green.H0_12 = -1i * (opt.KZ_pad .* Green.G0_12);
+Green.H0_13 = -1i * (opt.KZ_pad .* Green.G0_11 + opt.KX_pad .* Green.G0_12);
+Green.H0_21 = -1i * (opt.KX_pad .* Green.G0_21);
+Green.H0_22 = -1i * (opt.KZ_pad .* Green.G0_22);
+Green.H0_23 = -1i * (opt.KZ_pad .* Green.G0_21 + opt.KX_pad .* Green.G0_22);
+
+% ----------------------- INCIDENT FIELD (psi0) --------------------------
+U01 = ConvInt2(Green.G0_11, S1) + ConvInt2(Green.G0_12, S2);
+U02 = ConvInt2(Green.G0_21, S1) + ConvInt2(Green.G0_22, S2);
+
+% Apply sponge taper to RHS
+U01 = T .* U01;
+U02 = T .* U02;
+
+U0_vec = [U01(:); U02(:)];
+
+% ----------------------- SOLVE (I - G0 V) u = psi0 ----------------------
+AFUN = @(u) FD_AFUN_FFT_2D(u, Green, opt, dc);
+[U_vec, flag, relres, iter, resvec] = gmres(AFUN, U0_vec, gmres_restart, gmres_tol, gmres_maxit);
+
+U1 = reshape(U_vec(1:N), Nx, Nz);
+U2 = reshape(U_vec(N+1:end), Nx, Nz);
+
+% ----------------------- PLOTS: |Re| and |Im| ---------------------------
+figure('Name','Total displacement magnitudes (vertical force, 3-layer VTI)')
+colormap parula
+
+subplot(2,2,1)
+imagesc(X, Z, abs(real(U1))'); axis equal tight; set(gca,'YDir','normal')
+colorbar; title('|Re(U_x)|'); xlabel('X (m)'); ylabel('Z (m)')
+
+subplot(2,2,2)
+imagesc(X, Z, abs(imag(U1))'); axis equal tight; set(gca,'YDir','normal')
+colorbar; title('|Im(U_x)|'); xlabel('X (m)'); ylabel('Z (m)')
+
+subplot(2,2,3)
+imagesc(X, Z, abs(real(U2))'); axis equal tight; set(gca,'YDir','normal')
+colorbar; title('|Re(U_z)|'); xlabel('X (m)'); ylabel('Z (m)')
+
+subplot(2,2,4)
+imagesc(X, Z, abs(imag(U2))'); axis equal tight; set(gca,'YDir','normal')
+colorbar; title('|Im(U_z)|'); xlabel('X (m)'); ylabel('Z (m)')
+
+% ----------------------- GMRES CONVERGENCE -------------------------------
+if numel(iter) == 1
+    total_iters = iter;
+else
+    total_iters = (iter(1)-1)*gmres_restart + iter(2);
+end
+
+figure('Name','GMRES Convergence');
+k = 0:numel(resvec)-1;
+if ~isempty(resvec) && resvec(1) ~= 0
+    semilogy(k, resvec/resvec(1), 'o-','LineWidth',1.2);
+else
+    semilogy(k, resvec/max(resvec(1),eps), 'o-','LineWidth',1.2);
+end
+grid on; hold on
+yline(gmres_tol,'r--','Tolerance');
+hold off
+xlabel('Iteration'); ylabel('||r_k|| / ||r_0||');
+title(sprintf('GMRES: flag=%d, relres=%.2e, total iters=%d (restart=%d)', flag, relres, total_iters, gmres_restart));
+
+fprintf('GMRES: flag=%d, relres=%.3e, total iters=%d (restart=%d)\n', flag, relres, gmres_restart);
+fprintf('Done in %.2f s\n', toc(tstart));
+
+% ========================= FUNCTIONS =====================================
+
+function [c11,c33,c55,c13] = thomsen_to_stiffness(rho,Vp0,Vs0,epsilon,delta,~)
+    % Convert Thomsen parameters (VTI) to stiffnesses (c11,c33,c55,c13)
+    % Notation mapping (Love's A,C,L,F):
+    %   A = c11, C = c33, L = c55, F = c13
+    % Relations:
+    %   A = rho*Vp0^2*(1 + 2*epsilon)
+    %   C = rho*Vp0^2
+    %   L = rho*Vs0^2
+    %   delta = ((F+L)^2 - (C-L)^2)/(2*C*(C-L))  => F = -L + sqrt((C-L)*(C-L + 2*C*delta))
+    A = rho*Vp0^2*(1 + 2*epsilon);
+    C = rho*Vp0^2;
+    L = rho*Vs0^2;
+    CL = C - L;
+    F = -L + sqrt(max(CL.*(CL + 2*C*delta), 0));  % ensure non-negative under sqrt
+    c11 = A; c33 = C; c55 = L; c13 = F;
+end
+
+function [g0_11, g0_12, g0_21, g0_22] = build_G0_2D_vectorized(Nx, Nz, dx, dz, w, alpha, beta, rho0, dV)
+    % Vectorized isotropic 2D Green's tensor on doubled grid (no directional bias)
+    nx2 = (-Nx+1):Nx;
+    nz2 = (-Nz+1):Nz;
+    [NX, NZ] = ndgrid(nx2, nz2);
+    Rx = NX * dx;
+    Rz = NZ * dz;
+    r  = hypot(Rx, Rz);
+
+    % Radial regularization
+    RR = sqrt(dV/pi);
+    mask = (r < RR);
+    r(mask) = RR;
+
+    % Unit vectors
+    Rnx = zeros(size(Rx)); Rnz = zeros(size(Rz));
+    notmask = ~mask;
+    Rnx(notmask) = Rx(notmask) ./ r(notmask);
+    Rnz(notmask) = Rz(notmask) ./ r(notmask);
+    Rnx(mask) = 1/sqrt(2);
+    Rnz(mask) = 1/sqrt(2);
+
+    % Wavenumbers and Hankel combos
+    q = w/alpha; k = w/beta;
+    A = besselh(0,2,q*r)/alpha^2 + besselh(0,2,k*r)/beta^2;
+    B = besselh(2,2,q*r)/alpha^2 - besselh(2,2,k*r)/beta^2;
+    c = 1/(1i*8*rho0);
+
+    twoRn2m1_x = 2*(Rnx.^2) - 1;
+    twoRn2m1_z = 2*(Rnz.^2) - 1;
+    twoRnxz    = 2*(Rnx.*Rnz);
+
+    g0_11 = c*(A - B.*twoRn2m1_x);
+    g0_22 = c*(A - B.*twoRn2m1_z);
+    g0_12 = c*(   - B.*twoRnxz);
+    g0_21 = g0_12;
+end
+
+function ansC = ConvInt2(G0k, S)
+    [Nx, Nz] = size(S);
+    Fshape = size(G0k);
+    tmp = ifft2(G0k .* fft2(S, Fshape(1), Fshape(2)));
+    ansC = tmp(Nx+1:2*Nx, Nz+1:2*Nz);
+end
+
+function ansA = FD_AFUN_FFT_2D(u, Green, opt, dc)
+    Nx = opt.Nx; Nz = opt.Nz; N = Nx*Nz; w = opt.w; Fshape = opt.Fshape; T = opt.T;
+
+    U1 = reshape(u(1:N), Nx, Nz);
+    U2 = reshape(u(N+1:2*N), Nx, Nz);
+
+    % Spectral strain computation (replaces finite differences)
+    e = U2E_2D(U1, U2, opt);
+
+    % Stiffness part
+    tmp1 = (dc.dc11.*e{1} + dc.dc13.*e{2});
+    tmp2 = (dc.dc13.*e{1} + dc.dc33.*e{2});
+    tmp3 = dc.dc55.*e{3};
+
+    % Complex density ABL
+    if isfield(opt,'eta_map') && ~isempty(opt.eta_map)
+        sgn = -1; if isfield(opt,'abl_sign'), sgn = opt.abl_sign; end
+        drho_eff = dc.drho + (sgn*1i) * opt.rho_0 * opt.dV .* opt.eta_map;
+    else
+        drho_eff = dc.drho;
+    end
+
+    t1 = drho_eff .* U1;
+    t2 = drho_eff .* U2;
+
+    % FFTs
+    Ft1 = fft2(t1,  Fshape(1), Fshape(2));
+    Ft2 = fft2(t2,  Fshape(1), Fshape(2));
+    Fm1 = fft2(tmp1,Fshape(1), Fshape(2));
+    Fm2 = fft2(tmp2,Fshape(1), Fshape(2));
+    Fm3 = fft2(tmp3,Fshape(1), Fshape(2));
+
+    % x-component
+    K1 = (w^2)*(Green.G0_11.*Ft1 + Green.G0_12.*Ft2) ...
+       +        (Green.H0_11.*Fm1 + Green.H0_12.*Fm2 + Green.H0_13.*Fm3);
+    c1 = ifft2(K1);
+    c1 = c1(Nx+1:2*Nx, Nz+1:2*Nz);
+    out1 = T .* (U1 - c1);
+
+    % z-component
+    K2 = (w^2)*(Green.G0_21.*Ft1 + Green.G0_22.*Ft2) ...
+       +        (Green.H0_21.*Fm1 + Green.H0_22.*Fm2 + Green.H0_23.*Fm3);
+    c2 = ifft2(K2);
+    c2 = c2(Nx+1:2*Nx, Nz+1:2*Nz);
+    out2 = T .* (U2 - c2);
+
+    ansA = [out1(:); out2(:)];
+end
+
+function epsC = U2E_2D(u1,u2,opt)
+    % Spectral derivatives for small strains in 2D (x-z plane)
+    % epsilon_xx = du1/dx; epsilon_zz = du2/dz; gamma_xz = du2/dx + du1/dz
+    U1k = fft2(u1);
+    U2k = fft2(u2);
+    du1dx = ifft2(1i*opt.KX .* U1k);
+    du1dz = ifft2(1i*opt.KZ .* U1k);
+    du2dx = ifft2(1i*opt.KX .* U2k);
+    du2dz = ifft2(1i*opt.KZ .* U2k);
+    eps1 = du1dx;
+    eps2 = du2dz;
+    eps3 = du2dx + du1dz;  % engineering shear gamma_xz
+    epsC = {eps1, eps2, eps3};
+end
+
+function [KX, KZ] = build_k_grids(Nx, Nz, dx, dz)
+    % Construct 2D wavenumber grids for FFT-based derivatives
+    % Compatible with MATLAB's fft/ifft frequency ordering.
+    kx_vec = (2*pi/(Nx*dx)) * [0:ceil(Nx/2)-1, -floor(Nx/2):-1];
+    kz_vec = (2*pi/(Nz*dz)) * [0:ceil(Nz/2)-1, -floor(Nz/2):-1];
+    [KX, KZ] = ndgrid(kx_vec, kz_vec);
+end
+
+function [s, m] = build_abl_scale(Nx, Nz, n_thick, profile)
+    % Vectorized ABL scale and mask (isotropic thickness in cells)
+    [IX, IZ] = ndgrid(1:Nx, 1:Nz);
+    dist_x = min(IX - 1, Nx - IX);
+    dist_z = min(IZ - 1, Nz - IZ);
+    d = min(dist_x, dist_z);  % distance (in grid cells) from nearest outer boundary
+
+    tau = zeros(Nx, Nz);
+    inside = d < n_thick;
+    tau(inside) = 1 - d(inside) / max(n_thick, eps);
+
+    switch lower(profile)
+        case 'linear'
+            t = tau;
+        case 'sin2'
+            t = sin((pi/2) * tau).^2;
+        otherwise
+            t = tau;
+    end
+    t(~inside) = 0;
+    s = max(0, min(1, t));
+    m = 1 - s; % convenience: traditional sponge mask for plotting/comparison
+end
+
+function c_ref = pick_c_ref(Vp, Vs, mode)
+    switch lower(mode)
+        case 'vp', c_ref = Vp;
+        case 'vs', c_ref = Vs;
+        otherwise, c_ref = max(Vp, Vs);
+    end
+end
+
+function eta_max = compute_eta_max(w, d_abl, c_ref, R_target, p)
+    % For small imaginary mass term, choose eta_max to meet target reflection:
+    % eta_max = 2 (p+1) ln(1/R) c_ref / (w d_abl)
+    eta_max = 2 * (p+1) * log(1/max(R_target,1e-16)) * c_ref / max(w * max(d_abl,eps), eps);
+end
