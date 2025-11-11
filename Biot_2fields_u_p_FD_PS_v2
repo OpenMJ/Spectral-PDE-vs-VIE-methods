@@ -1,0 +1,392 @@
+% =========================================================================
+% Biot_2fields_u_p_FD_PS_v2.m
+% Fully Coupled Biot Two-Field System (u, p), Frequency Domain (e^{-i ω t})
+% Pseudo-spectral (FFT), Matrix-free GMRES, Block-diagonal Preconditioner
+%
+% Displacement:
+%   -ω^2 [ ρ u + (i sign_t) ω ρ_f^2 (B·u) ] - div( C:ε(u) ) - div( α p )
+%     - (i sign_t) ω ρ_f (B·∇p) = f
+%
+% Pressure (no direct q; coupling only):
+%   (i sign_t ω) p/M - div( B ∇p ) + (i sign_t) ω div( α·u )
+%     + ω^2 ρ_f div( B·u ) + (i sign_t) η_p p = 0
+%
+% Default: homogeneous & isotropic; VTI/heterogeneity supported by swapping maps.
+% Source only in displacement: 10 Hz harmonic with Gaussian spatial shape.
+% =========================================================================
+clear; clc; warning off
+
+%% ----------------------------- USER SETTINGS -----------------------------
+% Model size (meters)
+Lx = 4000;      % [m]
+Lz = 4000;      % [m]
+
+% Time convention (use 'em1' to match your elastodynamics code)
+timeConvention = 'em1';             % 'em1' (e^{-i ω t}) or 'ep1' (e^{+i ω t})
+sign_t = +1; if strcmpi(timeConvention,'ep1'), sign_t = -1; end
+
+% Frequency
+f0   = 10.0;                         % [Hz] central frequency (Ricker center)
+f_hz = f0;                           % harmonic solve at f0
+omega = 2*pi*f_hz;                   % [rad/s]
+
+% Elastic (isotropic defaults; VTI supported below)
+rho = 2200;                          % [kg/m^3]
+Vp0 = 3000;                          % [m/s]
+Vs0 = 1500;                          % [m/s]
+use_VTI = false;                     % set true to use Thomsen params
+eps_vti = 0.0; del_vti = 0.0; gam_vti = 0.0;
+
+% Biot / poroelastic coupling
+M_val      = 1.5e9;                  % [Pa]
+alpha_iso  = 0.5;                    % scalar α for isotropic default
+rho_f      = 1000;                   % [kg/m^3]
+B_iso      = 1e-7;                   % [m^2/(Pa·s)] isotropic mobility
+% For VTI mobility (if needed), set Bxx_val, Bzz_val, Bxz_val below.
+
+% Grid design for elastic waves (to see circular wavefronts clearly)
+ppw_min = 12;                        % min pts per S-wavelength
+
+% Sponge / ABL
+abs_thickness_wl   = 4.0;            % thickness in S-wavelengths (elastic ABL)
+eta_max_factor_u   = 1.0;            % scales complex density amplitude
+eps_rel_elastic    = 1e-6;
+eta_max_factor_p   = 0.3;            % weak pressure sponge (stabilization)
+eps_rel_pressure   = 1e-8;
+
+% GMRES
+restart = 100; tol = 1e-4; maxit = 50;
+
+% Source in displacement: Gaussian spatial distribution
+pol = [1, 0];                        % [fx, fz] polarization (unit)
+sigma_src_cells = 2;                 % ~2 grid cells
+
+%% --------------------------- GRID & WAVENUMBERS --------------------------
+lambda_s = Vs0 / max(f_hz, eps);
+dx = lambda_s / ppw_min; dz = dx;
+
+Nx = make_odd(round(Lx / dx)); Nz = make_odd(round(Lz / dz));
+dx = Lx / Nx; dz = Lz / Nz;              % snap to domain
+xax = (0:Nx-1)*dx; zax = (0:Nz-1)*dz;
+[X, Z] = ndgrid(xax, zax);
+[KX, KZ] = build_k_grids(Nx, Nz, dx, dz);
+KK2 = KX.^2 + KZ.^2;
+
+fprintf('Grid: Nx=%d, Nz=%d, dx=%.3f m, dz=%.3f m, PPW_S≈%.1f\n', ...
+        Nx, Nz, dx, dz, lambda_s/max(dx,eps));
+
+%% ---------------------------- ELASTIC MEDIUM -----------------------------
+if ~use_VTI
+    mu  = rho * Vs0^2;
+    lam = rho * (Vp0^2 - 2*Vs0^2);
+    c11 = (lam + 2*mu) * ones(Nx, Nz);
+    c33 = c11;
+    c55 = mu * ones(Nx, Nz);
+    c13 = lam * ones(Nx, Nz);
+else
+    [c11_1,c33_1,c55_1,c13_1] = thomsen_to_stiffness(rho,Vp0,Vs0,eps_vti,del_vti,0);
+    c11 = c11_1 * ones(Nx, Nz);
+    c33 = c33_1 * ones(Nx, Nz);
+    c55 = c55_1 * ones(Nx, Nz);
+    c13 = c13_1 * ones(Nx, Nz);
+end
+
+%% -------------------------- POROELASTIC FIELDS ---------------------------
+% α tensor (isotropic default): α_xx = α_zz = α_iso, α_xz = 0
+alpha = struct();
+alpha.xx = alpha_iso * ones(Nx, Nz);
+alpha.zz = alpha_iso * ones(Nx, Nz);
+alpha.xz = zeros(Nx, Nz);
+
+% Mobility tensor (isotropic default)
+Bxx = B_iso * ones(Nx, Nz);
+Bzz = B_iso * ones(Nx, Nz);
+Bxz = zeros(Nx, Nz);    % set nonzero for cross-coupling (VTI)
+
+% Biot modulus
+Mfield = M_val * ones(Nx, Nz);
+
+%% ------------------------------- SOURCES ---------------------------------
+% Displacement source: Gaussian at center (harmonic at f0)
+sx = ceil((Nx+1)/2); sz = ceil((Nz+1)/2);
+S = gaussian_point(Nx, Nz, sx, sz, sigma_src_cells);
+fx = pol(1) * S;
+fz = pol(2) * S;
+
+% No direct pressure source (q=0); coupling drives p.
+
+%% -------------------------- SPONGE / ABSORBING ---------------------------
+% Elastic sponge via complex density
+Vs_min = Vs0; lambda_s_min = Vs_min / max(f_hz, eps);
+thickness_m_el = abs_thickness_wl * lambda_s_min;
+[eta_profile_el, ~] = build_sponge_quadratic_with_t(Nx, Nz, Lx, Lz, thickness_m_el);
+eta_rho = eta_max_factor_u * rho * eta_profile_el + eps_rel_elastic * rho;
+rho_eff = rho + 1i * sign_t * eta_rho;
+
+% Pressure sponge: weak imaginary “mass-like” term (i sign_t η_p p)
+thickness_m_p = thickness_m_el;   % reuse thickness
+[eta_profile_p, ~] = build_sponge_quadratic_with_t(Nx, Nz, Lx, Lz, thickness_m_p);
+eta_char_p = mean(omega ./ Mfield, 'all');
+eta_p = eta_max_factor_p * eta_char_p * eta_profile_p + eps_rel_pressure * eta_char_p;
+
+%% -------------------- PACK/UNPACK & MONOLITHIC OPERATOR ------------------
+N  = Nx*Nz;
+pack_u    = @(u1,u2) [u1(:); u2(:)];
+unpack_u  = @(x) deal(reshape(x(1:N),Nx,Nz), reshape(x(N+1:2*N),Nx,Nz));
+pack_up   = @(u1,u2,p) [u1(:); u2(:); p(:)];
+unpack_up = @(x) deal(reshape(x(1:N),Nx,Nz), reshape(x(N+1:2*N),Nx,Nz), reshape(x(2*N+1:3*N),Nx,Nz));
+
+% Monolithic apply A*[u;p]
+Afun = @(x) applyA_biot_coupled( ...
+            x, Nx, Nz, KX, KZ, KK2, ...
+            rho_eff, c11, c33, c55, c13, ...
+            alpha, Mfield, Bxx, Bzz, Bxz, ...
+            rho_f, omega, sign_t, eta_p, pack_up, unpack_up);
+
+% Right-hand side packs [f; 0]
+b = [fx(:); fz(:); zeros(N,1)];
+
+%% --------------------------- BLOCK PRECONDITIONER ------------------------
+% Elastic block preconditioner (isotropic, spectral)
+rho0_eff = mean(rho_eff(:));
+mu0  = rho * Vs0^2;
+lam0 = rho * (Vp0^2 - 2*Vs0^2);
+Mprec_u = @(r_u_vec) applyMinv_isoFFT_u( ...
+                   r_u_vec, Nx, Nz, KX, KZ, KK2, omega, rho0_eff, lam0, mu0, pack_u, unpack_u);
+
+% Pressure block preconditioner (constant coefficients)
+M0    = mean(Mfield(:));
+B0xx  = mean(Bxx(:)); B0zz = mean(Bzz(:)); B0xz = mean(Bxz(:));
+eta0  = mean(eta_p(:));
+eps_shift = (1e-14) * (1+1i);
+Mprec_p = @(r_p_vec) applyMinv_pressure_isoFFT( ...
+                   r_p_vec, Nx, Nz, KX, KZ, M0, B0xx, B0zz, B0xz, omega, sign_t, eta0, eps_shift);
+
+% Assemble block-diagonal preconditioner M^{-1} = diag(Mu^{-1}, Mp^{-1})
+Mprec = @(r_vec) block_prec_apply(r_vec, Nx, Nz, Mprec_u, Mprec_p);
+
+%% -------------------------------- GMRES ---------------------------------
+x0 = zeros(3*N,1);
+[xsol, flag, relres, iter, resvec] = gmres(Afun, b, restart, tol, maxit, Mprec, [], x0);
+if numel(iter)==2, total_iters = (iter(1)-1)*restart + iter(2); else, total_iters = iter; end
+[u1, u2, p] = unpack_up(xsol);
+
+fprintf('BIOT GMRES: flag=%d, relres=%.2e, total iters=%d (restart=%d)\n', ...
+        flag, relres, total_iters, restart);
+
+%% -------------------------------- PLOTS ----------------------------------
+% Displacement magnitudes (expect circular wavefronts)
+figure('Name','Displacement (10 Hz, fully coupled Biot)'); colormap parula
+subplot(2,2,1); imagesc(xax, zax, abs(real(u1)).'); axis equal tight; set(gca,'YDir','normal'); colorbar
+title('|Re(U_x)|'); xlabel('X (m)'); ylabel('Z (m)')
+subplot(2,2,2); imagesc(xax, zax, abs(imag(u1)).'); axis equal tight; set(gca,'YDir','normal'); colorbar
+title('|Im(U_x)|'); xlabel('X (m)'); ylabel('Z (m)')
+subplot(2,2,3); imagesc(xax, zax, abs(real(u2)).'); axis equal tight; set(gca,'YDir','normal'); colorbar
+title('|Re(U_z)|'); xlabel('X (m)'); ylabel('Z (m)')
+subplot(2,2,4); imagesc(xax, zax, abs(imag(u2)).'); axis equal tight; set(gca,'YDir','normal'); colorbar
+title('|Im(U_z)|'); xlabel('X (m)'); ylabel('Z (m)')
+
+% Pressure magnitude
+figure('Name','Pressure (fully coupled)'); colormap parula
+subplot(2,2,1); imagesc(xax, zax, abs(real(p)).'); axis equal tight; set(gca,'YDir','normal'); colorbar
+title('|Re(p)|'); xlabel('X (m)'); ylabel('Z (m)')
+subplot(2,2,2); imagesc(xax, zax, abs(imag(p)).'); axis equal tight; set(gca,'YDir','normal'); colorbar
+title('|Im(p)|'); xlabel('X (m)'); ylabel('Z (m)')
+subplot(2,2,3); imagesc(xax, zax, abs(p).'); axis equal tight; set(gca,'YDir','normal'); colorbar
+title('|p|'); xlabel('X (m)'); ylabel('Z (m)')
+subplot(2,2,4); imagesc(xax, zax, abs(p./max(abs(p(:))+eps)).'); axis equal tight; set(gca,'YDir','normal'); colorbar
+title('|p| (normalized)'); xlabel('X (m)'); ylabel('Z (m)')
+
+% GMRES convergence
+figure('Name','GMRES Convergence (Biot coupled)')
+k = 0:numel(resvec)-1;
+if ~isempty(resvec) && resvec(1) ~= 0
+    semilogy(k, resvec/resvec(1), 'o-','LineWidth',1.2);
+else
+    semilogy(k, resvec/max(resvec(1),eps), 'o-','LineWidth',1.2);
+end
+grid on; hold on; yline(tol,'r--','Tolerance'); hold off
+xlabel('Iteration'); ylabel('||r_k|| / ||r_0||');
+title(sprintf('GMRES: flag=%d, relres=%.2e, iters=%d (restart=%d)', flag, relres, total_iters, restart));
+
+% =========================================================================
+%                                 FUNCTIONS
+% =========================================================================
+function y = applyA_biot_coupled(x, Nx, Nz, KX, KZ, KK2, ...
+                                 rho_eff, c11, c33, c55, c13, ...
+                                 alpha, Mfield, Bxx, Bzz, Bxz, ...
+                                 rho_f, omega, sign_t, eta_p, pack_up, unpack_up)
+% Applies the monolithic Biot operator A*[u;p] with full coupling
+    [u1, u2, p] = unpack_up(x);
+
+    % ---------- Elastic strain and stress ----------
+    U1k = fft2(u1); U2k = fft2(u2);
+    du1dx = ifft2(1i*KX .* U1k); du1dz = ifft2(1i*KZ .* U1k);
+    du2dx = ifft2(1i*KX .* U2k); du2dz = ifft2(1i*KZ .* U2k);
+
+    e_xx = du1dx; e_zz = du2dz; g_xz = du2dx + du1dz;
+
+    s_xx = c11 .* e_xx + c13 .* e_zz;
+    s_zz = c13 .* e_xx + c33 .* e_zz;
+    s_xz = c55 .* g_xz;
+
+    Sxxk = fft2(s_xx); Szzk = fft2(s_zz); Sxzk = fft2(s_xz);
+    div1 = ifft2(1i*KX .* Sxxk + 1i*KZ .* Sxzk);
+    div2 = ifft2(1i*KX .* Sxzk + 1i*KZ .* Szzk);
+
+    % ---------- Coupling term: -div(α p) ----------
+    Sxx_a = alpha.xx .* p;
+    Szz_a = alpha.zz .* p;
+    Sxz_a = alpha.xz .* p;
+    Sxx_a_k = fft2(Sxx_a); Szz_a_k = fft2(Szz_a); Sxz_a_k = fft2(Sxz_a);
+    div1_alpha = ifft2(1i*KX .* Sxx_a_k + 1i*KZ .* Sxz_a_k);
+    div2_alpha = ifft2(1i*KX .* Sxz_a_k + 1i*KZ .* Szz_a_k);
+    su_alpha1 = - div1_alpha;
+    su_alpha2 = - div2_alpha;
+
+    % ---------- Coupling term: -(i sign_t) ω ρ_f (B ∇p) ----------
+    Pk  = fft2(p);
+    dpx = ifft2(1i*KX .* Pk);
+    dpz = ifft2(1i*KZ .* Pk);
+    vx_bp = Bxx .* dpx + Bxz .* dpz;
+    vz_bp = Bxz .* dpx + Bzz .* dpz;
+    su_bp1 = - (1i*sign_t) * omega * rho_f .* vx_bp;
+    su_bp2 = - (1i*sign_t) * omega * rho_f .* vz_bp;
+
+    % ---------- Additional inertial coupling: -ω^2 (i sign_t ω ρ_f^2) (B·u) ----------
+    Bu_x = Bxx .* u1 + Bxz .* u2;
+    Bu_z = Bxz .* u1 + Bzz .* u2;
+    mass_Bu1 = - (1i*sign_t) * (omega^3) * (rho_f^2) .* Bu_x;
+    mass_Bu2 = - (1i*sign_t) * (omega^3) * (rho_f^2) .* Bu_z;
+
+    % ---------- Assemble displacement block ----------
+    y1 = - (omega^2) * rho_eff .* u1 - div1 + su_alpha1 + su_bp1 + mass_Bu1;
+    y2 = - (omega^2) * rho_eff .* u2 - div2 + su_alpha2 + su_bp2 + mass_Bu2;
+
+    % ---------- Pressure block ----------
+    % A_p(p) = (i sign_t ω) p/M + (i sign_t) η_p p - div( B ∇p )
+    Vxk = fft2(vx_bp); Vzk = fft2(vz_bp);     % reuse vx_bp,vz_bp = B∇p
+    div_Bgradp = ifft2(1i*KX .* Vxk + 1i*KZ .* Vzk);
+    mass_p = (1i*sign_t) * omega * (p ./ max(Mfield, eps)) + (1i*sign_t) * eta_p .* p;
+
+    % Coupling s_p(u) = (i sign_t) ω div(α·u) + ω^2 ρ_f div(B·u)
+    Au_x = alpha.xx .* u1 + alpha.xz .* u2;
+    Au_z = alpha.xz .* u1 + alpha.zz .* u2;
+    AUk_x = fft2(Au_x); AUk_z = fft2(Au_z);
+    div_Au = ifft2(1i*KX .* AUk_x + 1i*KZ .* AUk_z);
+
+    BUk_x = fft2(Bu_x); BUk_z = fft2(Bu_z);  % reuse Bu_x, Bu_z = B·u
+    div_Bu = ifft2(1i*KX .* BUk_x + 1i*KZ .* BUk_z);
+
+    sp = (1i*sign_t) * omega * div_Au + (omega^2) * rho_f * div_Bu;
+
+    y3 = mass_p - div_Bgradp + sp;
+
+    y = [y1(:); y2(:); y3(:)];
+end
+
+function z = applyMinv_isoFFT_u(r, Nx, Nz, KX, KZ, KK2, omega, rho0_eff, lambda0, mu0, pack_u, unpack_u)
+% Isotropic elastic spectral preconditioner:
+% A_u(k) = -ω^2 ρ0 I + μ0 |k|^2 I + (λ0+μ0) k k^T
+    [r1, r2] = unpack_u(r);
+    R1 = fft2(r1); R2 = fft2(r2);
+    kx = KX; kz = KZ; k2 = KK2;
+    a = - (omega^2) * rho0_eff + mu0 * k2;
+    b = (lambda0 + mu0);
+    tiny = (1e-14)*(1+1i);
+    a_safe = a; a_safe(abs(a_safe) < 1e-14) = a_safe(abs(a_safe) < 1e-14) + tiny;
+    Rdot = kx .* R1 + kz .* R2;
+    denom = a_safe .* (a_safe + b * k2);
+    denom(abs(denom) < 1e-14) = denom(abs(denom) < 1e-14) + tiny;
+    coef = b ./ denom;
+    Z1_hat = (R1 ./ a_safe) - coef .* kx .* Rdot;
+    Z2_hat = (R2 ./ a_safe) - coef .* kz .* Rdot;
+    z1 = ifft2(Z1_hat);
+    z2 = ifft2(Z2_hat);
+    z  = [z1(:); z2(:)];
+end
+
+function z_vec = applyMinv_pressure_isoFFT(r_vec, Nx, Nz, KX, KZ, M0, B0xx, B0zz, B0xz, ...
+                                           omega, sign_t, eta_p0, eps_shift)
+% Pressure spectral preconditioner:
+% A_p0(k) = i sign_t ω / M0 + k^T B0 k + i sign_t η_p0
+    r = reshape(r_vec, Nx, Nz);
+    Rk = fft2(r);
+    kx = KX; kz = KZ;
+    symB = B0xx.*(kx.^2) + 2*B0xz.*(kx.*kz) + B0zz.*(kz.^2);
+    sym0 = 1i*sign_t*omega/max(M0, eps) + symB + 1i*sign_t*eta_p0;
+    tiny = (1e-14) * (1+1i);
+    mask = (abs(sym0) < 1e-14);
+    sym0(mask) = sym0(mask) + tiny + eps_shift;
+    Zk = Rk ./ sym0;
+    z = ifft2(Zk);
+    z_vec = z(:);
+end
+
+function y = block_prec_apply(r_vec, Nx, Nz, Mprec_u, Mprec_p)
+% Applies block-diagonal preconditioner: diag(Mu^{-1}, Mp^{-1})
+    N = Nx*Nz;
+    r_u = r_vec(1:2*N);
+    r_p = r_vec(2*N+1:3*N);
+    z_u = Mprec_u(r_u);
+    z_p = Mprec_p(r_p);
+    y = [z_u; z_p];
+end
+
+function S = gaussian_point(Nx, Nz, sx, sz, sigma_cells)
+% Unit-peak Gaussian centered at (sx,sz) with width ~ sigma_cells
+    [Xg, Zg] = ndgrid(1:Nx, 1:Nz);
+    S = exp(- ((Xg - sx).^2 + (Zg - sz).^2) / (2*sigma_cells^2) );
+    S = S / max(S(:));
+end
+
+function [KX, KZ] = build_k_grids(Nx, Nz, dx, dz)
+% Periodic wavenumber grids (MATLAB FFT ordering)
+    kx_vec = (2*pi/(Nx*dx)) * [0:ceil(Nx/2)-1, -floor(Nx/2):-1];
+    kz_vec = (2*pi/(Nz*dz)) * [0:ceil(Nz/2)-1, -floor(Nz/2):-1];
+    [KX, KZ] = ndgrid(kx_vec, kz_vec);
+end
+
+function [eta, tau] = build_sponge_quadratic_with_t(Nx, Nz, Lx, Lz, thickness_m)
+% Quadratic ABL profile (eta = tau.^2)
+    x = (0:Nx-1) * (Lx/Nx);
+    z = (0:Nz-1) * (Lz/Nz);
+    [Xg, Zg] = ndgrid(x, z);
+    d_left = Xg; d_right = Lx - Xg; d_top = Zg; d_bottom = Lz - Zg;
+    dmin = min(min(d_left, d_right), min(d_top, d_bottom));
+    tau = max(0, min(1, (thickness_m - dmin) / max(thickness_m, eps)));
+    eta = tau.^2;
+end
+
+function [c11,c33,c55,c13] = thomsen_to_stiffness(rho,Vp0,Vs0,epsilon,delta,~)
+% Thomsen (VTI) to stiffness: c11,c33,c55,c13 (Voigt)
+    A = rho*Vp0^2*(1 + 2*epsilon);
+    C = rho*Vp0^2;
+    L = rho*Vs0^2;
+    CL = C - L;
+    F = -L + sqrt(max(CL.*(CL + 2*C*delta), 0));
+    c11 = A; c33 = C; c55 = L; c13 = F;
+end
+
+function n_odd = make_odd(n)
+% Ensure odd integer >= 3
+    n_odd = max(3, n + mod(n+1,2));
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
