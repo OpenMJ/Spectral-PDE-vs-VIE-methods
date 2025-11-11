@@ -1,0 +1,276 @@
+% 2D Pressure Diffusion (Biot, no coupling), frequency-domain
+% Pseudo-spectral (FFT), matrix-free GMRES, spectral preconditioner
+%
+% YOU SPECIFY:
+%   - Total model size Lx, Lz (meters)
+%   - Poroelastic constants (M, B, f) that determine diffusion length
+% CODE AUTOMATICALLY:
+%   - Computes diffusion length(s) from (M, B, ω)
+%   - Chooses grid spacing and odd grid sizes to center the source
+% DEFAULT:
+%   - Isotropic, homogeneous medium
+%   - Structure supports VTI anisotropy and heterogeneous maps
+%
+% PDE (no coupling):
+%   (i*sign_t*ω)*(p./M) + i*sign_t*eta_p.*p - ∇·(B ∇p) = q
+%
+% Date: 11 Nov 2025
+
+clear; clc; warning off
+
+%% --------------------------- USER TOP SETTINGS ---------------------------
+% ---- Model size (meters) ----
+Lx = 200;          % total horizontal length [m]
+Lz = 200;          % total vertical length   [m]
+
+% ---- Time convention ----
+timeConvention = 'em1';            % 'em1' (e^{-i ω t}) or 'ep1' (e^{+i ω t})
+sign_t = +1; if strcmpi(timeConvention,'ep1'), sign_t = -1; end
+
+% ---- Frequency ----
+f_hz  = 0.01;                      % [Hz]
+omega = 2*pi*f_hz;                 % [rad/s]; must be > 0 for diffusion length
+
+% ---- Poroelastic constants (homogeneous defaults) ----
+M_val = 1.5e9;                     % Biot modulus [Pa]
+% Isotropic mobility (default):
+B_iso = 1e-7;                      % [m^2/(Pa·s)]
+% If you prefer VTI anisotropy, specify below (Bxz can be nonzero)
+use_VTI = false;
+Bxx_val = B_iso; Bzz_val = B_iso; Bxz_val = 0.0;
+
+% ---- Grid resolution strategy ----
+% The grid spacing is derived from diffusion length(s) to achieve at least
+% ppell_min points per diffusion length (worst-case by default).
+ppell_min       = 25;              % minimum points per diffusion length
+resolution_mode = 'worstcase';     % 'worstcase' | 'axiswise'
+% 'axiswise': uses ℓx for dx and ℓz for dz (requires Bxz≈0 for strict meaning)
+% 'worstcase': uses ℓ_min for both dx and dz (safe for any symmetric B)
+
+% ---- Sponge/ABL ----
+abl_ell_thickness = 3.0;           % thickness = abl_ell_thickness * ℓ_ref
+eta_max_factor    = 0.5;           % 0 (off) ... 1 (strong)
+eps_rel           = 1e-8;          % tiny uniform imaginary mass term (stability)
+
+% ---- Source (Gaussian injection) ----
+gauss_sigma_per_ell = 1/6;         % σ ≈ ℓ_ref/6, clipped to ≥ 2 grid steps
+
+% ---- Solver / GMRES ----
+restart = 60; tol = 1e-6; maxit = 300;
+
+%% ------------------------ DIFFUSION LENGTH FROM (M, B, ω) ----------------
+assert(omega > 0, 'omega must be > 0 to define a diffusion length.');
+
+M_hom = M_val;
+if ~use_VTI
+    Bxx_hom = B_iso; Bzz_hom = B_iso; Bxz_hom = 0.0;
+    ell_iso = sqrt( 2*M_hom*B_iso / omega )  % isotropic target length
+    ell_x = ell_iso; ell_z = ell_iso; ell_min = ell_iso;
+    ell_ref = ell_iso;  % used for ABL and source sizing
+else
+    Bxx_hom = Bxx_val; Bzz_hom = Bzz_val; Bxz_hom = Bxz_val;
+    % Axis-wise measures (valid when Bxz≈0); otherwise indicative.
+    ell_x = sqrt( max(2*M_hom*Bxx_hom/omega, 0) );
+    ell_z = sqrt( max(2*M_hom*Bzz_hom/omega, 0) );
+    % Worst-case via smallest eigenvalue of B:
+    [lam_min, lam_max] = eigvals2_sym(Bxx_hom, Bzz_hom, Bxz_hom);
+    ell_min = sqrt( max(2*M_hom*lam_min/omega, 0) );
+    ell_ref = ell_min;  % conservative reference for ABL and source
+end
+
+fprintf('Diffusion lengths [m]: ell_x=%.3f, ell_z=%.3f, ell_min=%.3f (f=%.5e Hz)\n', ell_x, ell_z, ell_min, f_hz);
+
+%% ------------------------------ GRID DESIGN ------------------------------
+switch lower(resolution_mode)
+    case 'axiswise'
+        % Use axis-wise resolution (interpretation is strongest if Bxz≈0)
+        dx_target = max(ell_x / ppell_min, eps);
+        dz_target = max(ell_z / ppell_min, eps);
+    otherwise
+        % Worst-case resolution based on ell_min
+        dx_target = max(ell_min / ppell_min, eps);
+        dz_target = dx_target;
+end
+
+% Choose odd grid sizes from total lengths and target spacings
+Nx = make_odd( max(3, round(Lx / dx_target)) );
+Nz = make_odd( max(3, round(Lz / dz_target)) );
+
+% Recompute grid spacings to exactly tile the domain
+dx = Lx / Nx; dz = Lz / Nz;
+
+% Build axes & wavenumbers
+xax = (0:Nx-1)*dx; zax = (0:Nz-1)*dz;
+[X, Z] = ndgrid(xax, zax);
+[KX, KZ] = build_k_grids(Nx, Nz, dx, dz);
+
+% Report achieved points-per-ell
+ppell_x = ell_x / dx; ppell_z = ell_z / dz;
+fprintf('Grid: Nx=%d, Nz=%d, Lx=%.1f m, Lz=%.1f m, dx=%.3f m, dz=%.3f m\n', Nx, Nz, Lx, Lz, dx, dz);
+fprintf('Achieved ppell: along x: %.1f  along z: %.1f  (min requirement=%.1f)\n', ppell_x, ppell_z, ppell_min);
+if min(ppell_x, ppell_z) < ppell_min
+    warning('Resolution below ppell_min in at least one direction. Consider increasing L or using ''worstcase'' mode.');
+end
+
+%% ---------------------------- MEDIA FIELDS -------------------------------
+% Default: homogeneous fields; replace with spatial maps for heterogeneity
+Mfield = M_hom * ones(Nx, Nz);
+Bxx    = Bxx_hom * ones(Nx, Nz);
+Bzz    = Bzz_hom * ones(Nx, Nz);
+Bxz    = Bxz_hom * ones(Nx, Nz);   % keep symmetric: Bxz == Bzx
+
+%% ------------------------------ SOURCE ----------------------------------
+% Center indices (odd grid ensures exact center)
+sx = ceil((Nx+1)/2); sz = ceil((Nz+1)/2);
+x0 = xax(sx); z0 = zax(sz);
+
+% Gaussian widths: use ℓ_ref and clamp to >= 2 grid steps
+sigma_tgt = ell_ref * gauss_sigma_per_ell;
+sigma_x = max(2*dx, sigma_tgt);
+sigma_z = max(2*dz, sigma_tgt);
+
+q = exp( - ((X - x0).^2)/(2*sigma_x^2) - ((Z - z0).^2)/(2*sigma_z^2) );
+q = q / max(abs(q(:)));    % peak normalized to 1
+% If you disable sponge entirely, you can enforce zero-mean RHS:
+% q = q - mean(q(:));
+
+%% ------------------------------ SPONGE -----------------------------------
+% Thickness proportional to ℓ_ref
+thickness_m = abl_ell_thickness * ell_ref;
+[eta_profile, ~] = build_sponge_quadratic_with_t(Nx, Nz, Lx, Lz, thickness_m);
+
+% Sponge amplitude scaled by characteristic i*ω/M magnitude
+invM   = 1 ./ max(Mfield, eps);
+eta_ch = mean(omega * invM, 'all');      % [1/(Pa·s)]
+eta_p  = eta_max_factor * eta_ch * eta_profile + eps_rel * eta_ch;
+
+%% ------------------------- OPERATOR & PRECONDITIONER ---------------------
+pack   = @(p) p(:);
+unpack = @(x) reshape(x, Nx, Nz);
+
+Afun = @(p_vec) applyA_pressure_diffusion( ...
+                  p_vec, Nx, Nz, KX, KZ, Mfield, Bxx, Bzz, Bxz, ...
+                  omega, sign_t, eta_p, pack, unpack);
+
+% Constant-coefficient spectral preconditioner (domain averages)
+M0    = mean(Mfield(:));
+B0xx  = mean(Bxx(:)); B0zz = mean(Bzz(:)); B0xz = mean(Bxz(:));
+eta_p0= mean(eta_p(:));
+eps_shift = (1e-14) * (1+1i);
+
+Mprec = @(r_vec) applyMinv_pressure_isoFFT( ...
+                  r_vec, Nx, Nz, KX, KZ, M0, B0xx, B0zz, B0xz, ...
+                  omega, sign_t, eta_p0, eps_shift);
+
+%% --------------------------------- GMRES ---------------------------------
+Ntot = Nx * Nz;
+b    = pack(q);
+x0v  = zeros(Ntot,1);
+[xsol, flag, relres, iter, resvec] = gmres(Afun, b, restart, tol, maxit, Mprec, [], x0v);
+if numel(iter) == 2, total_iters = (iter(1)-1)*restart + iter(2); else, total_iters = iter; end
+p = unpack(xsol);
+
+fprintf('GMRES: flag=%d, relres=%.2e, total iters=%d (restart=%d)\n', flag, relres, total_iters, restart);
+
+%% -------------------------------- FIGURES --------------------------------
+figure('Name','Pressure diffusion solution (no coupling)'); colormap parula
+subplot(2,2,1); imagesc(xax, zax, abs(real(p)).'); axis equal tight; set(gca,'YDir','normal')
+colorbar; title('|Re(p)|'); xlabel('X (m)'); ylabel('Z (m)')
+subplot(2,2,2); imagesc(xax, zax, abs(imag(p)).'); axis equal tight; set(gca,'YDir','normal')
+colorbar; title('|Im(p)|'); xlabel('X (m)'); ylabel('Z (m)')
+subplot(2,2,3); imagesc(xax, zax, abs(p).'); axis equal tight; set(gca,'YDir','normal')
+colorbar; title('|p|'); xlabel('X (m)'); ylabel('Z (m)')
+subplot(2,2,4); imagesc(xax, zax, abs(p./max(abs(p(:))+eps)).'); axis equal tight; set(gca,'YDir','normal')
+colorbar; title('|p| (normalized)'); xlabel('X (m)'); ylabel('Z (m)')
+
+figure('Name','GMRES Convergence (pressure)')
+k = 0:numel(resvec)-1;
+if ~isempty(resvec) && resvec(1) ~= 0
+    semilogy(k, resvec/resvec(1), 'o-','LineWidth',1.2);
+else
+    semilogy(k, resvec/max(resvec(1),eps), 'o-','LineWidth',1.2);
+end
+grid on; hold on; yline(tol,'r--','Tolerance'); hold off
+xlabel('Iteration'); ylabel('||r_k|| / ||r_0||');
+title(sprintf('GMRES: flag=%d, relres=%.2e, total iters=%d (restart=%d)', flag, relres, total_iters, restart));
+
+%% ============================== FUNCTIONS ===============================
+function y_vec = applyA_pressure_diffusion(p_vec, Nx, Nz, KX, KZ, Mfield, Bxx, Bzz, Bxz, ...
+                                           omega, sign_t, eta_p, pack, unpack)
+% A(p) = (i*sign_t*ω)*(p./M) + i*sign_t*eta_p.*p - ∇·(B ∇p)
+    p = unpack(p_vec);
+
+    % ∇p via FFT
+    Pk  = fft2(p);
+    dpx = ifft2(1i*KX .* Pk);
+    dpz = ifft2(1i*KZ .* Pk);
+
+    % v = B ∇p (symmetric 2x2 tensor field)
+    vx = Bxx .* dpx + Bxz .* dpz;
+    vz = Bxz .* dpx + Bzz .* dpz;
+
+    % ∇·v via FFT
+    Vxk = fft2(vx); Vzk = fft2(vz);
+    div_v = ifft2(1i*KX .* Vxk + 1i*KZ .* Vzk);
+
+    % Mass + sponge
+    mass_term = 1i * sign_t * omega * (p ./ max(Mfield, eps));
+    sponge    = 1i * sign_t * eta_p .* p;
+
+    y = mass_term + sponge - div_v;
+    y_vec = pack(y);
+end
+
+function z_vec = applyMinv_pressure_isoFFT(r_vec, Nx, Nz, KX, KZ, M0, B0xx, B0zz, B0xz, ...
+                                           omega, sign_t, eta_p0, eps_shift)
+% M^{-1}(k) = 1 / (i*sign_t*ω/M0 + k^T B0 k + i*sign_t*eta_p0 + eps_shift)
+    r = reshape(r_vec, Nx, Nz);
+    Rk = fft2(r);
+
+    kx = KX; kz = KZ;
+    symB = B0xx.*(kx.^2) + 2*B0xz.*(kx.*kz) + B0zz.*(kz.^2);
+    sym0 = 1i*sign_t*omega/max(M0, eps) + symB + 1i*sign_t*eta_p0;
+
+    tiny = (1e-14) * (1+1i);
+    mask = (abs(sym0) < 1e-14);
+    sym0(mask) = sym0(mask) + tiny + eps_shift;
+
+    Zk = Rk ./ sym0;
+    z  = ifft2(Zk);
+    z_vec = z(:);
+end
+
+function [lam_min, lam_max] = eigvals2_sym(a, c, b)
+% Eigenvalues of 2x2 symmetric matrix [a b; b c]
+    tr = a + c;
+    detv = a.*c - b.*b;
+    disc = max(tr.^2/4 - detv, 0);
+    root = sqrt(disc);
+    lam1 = tr/2 - root;
+    lam2 = tr/2 + root;
+    lam_min = min(lam1, lam2);
+    lam_max = max(lam1, lam2);
+end
+
+function [KX, KZ] = build_k_grids(Nx, Nz, dx, dz)
+    kx_vec = (2*pi/(Nx*dx)) * [0:ceil(Nx/2)-1, -floor(Nx/2):-1];
+    kz_vec = (2*pi/(Nz*dz)) * [0:ceil(Nz/2)-1, -floor(Nz/2):-1];
+    [KX, KZ] = ndgrid(kx_vec, kz_vec);
+end
+
+function [eta, tau] = build_sponge_quadratic_with_t(Nx, Nz, Lx, Lz, thickness_m)
+% tau: boundary ramp (0 in interior, 1 at boundary over thickness_m)
+% eta: quadratic sponge profile = tau.^2
+    x = (0:Nx-1) * (Lx/Nx);
+    z = (0:Nz-1) * (Lz/Nz);
+    [Xg, Zg] = ndgrid(x, z);
+    d_left = Xg; d_right = Lx - Xg; d_top = Zg; d_bottom = Lz - Zg;
+    dmin = min(min(d_left, d_right), min(d_top, d_bottom));
+    tau = max(0, min(1, (thickness_m - dmin) / max(thickness_m, eps)));
+    eta = tau.^2;
+end
+
+function n_odd = make_odd(n)
+% Ensure odd integer (>= 3)
+    n_odd = max(3, n + mod(n+1,2));
+end
