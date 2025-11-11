@@ -1,0 +1,445 @@
+% =========================================================================
+% Coupled Biot (2D, frequency-domain) using pseudo-spectral (FFT) + GMRES
+% Unknowns: [Ux, Uz, p]
+%  - Elastic wave operator (VTI stiffness) + complex density sponge
+%  - Pressure diffusion operator + sponge
+%  - Coupling terms included (two-field Biot: displacement-pressure)
+% Matrix-free block operator; block-diagonal spectral preconditioner.
+%
+% Default: homogeneous isotropic parameters (VTI-ready; heterogeneous-ready)
+% Grid: chosen automatically from diffusion length implied by (M, B, ω)
+%       and user-specified domain lengths Lx, Lz.
+%
+% Author: Prepared for Morten Jakobsen
+% Date:   11 Nov 2025
+% =========================================================================
+clear; clc; warning off
+
+%% --------------------------- USER SETTINGS -------------------------------
+% --- Domain (meters) ---
+Lx = 600;  % total length in x
+Lz = 600;  % total length in z
+
+% --- Time convention ---
+timeConvention = 'em1';     % 'em1' (e^{-i ω t}) or 'ep1' (e^{+i ω t})
+sign_t = +1; if strcmpi(timeConvention,'ep1'), sign_t = -1; end
+
+% --- Frequency ---
+f_hz  = 0.01;                % [Hz]
+omega = 2*pi*f_hz;           % [rad/s] (>0)
+
+% --- Fluid & Biot parameters (homogeneous defaults) ---
+rho_s = 2650;                % solid grain density [kg/m^3] (for reference)
+rho_f = 1000;                % fluid density [kg/m^3]
+phi   = 0.2;                 % porosity (for info; not explicitly needed here)
+rho   = 2200;                % bulk density [kg/m^3] (used in mechanics)
+M_val = 1.5e9;               % Biot modulus [Pa]
+
+% Mobility tensor B (default isotropic). Units: m^2/(Pa·s)
+use_VTI_B = false;
+B_iso     = 1e-9;            % isotropic dynamic mobility
+Bxx_val   = B_iso;           % if use_VTI_B=true, set these
+Bzz_val   = B_iso;
+Bxz_val   = 0.0;
+
+% Coupling tensor alpha (default isotropic alpha*I)
+alpha_iso = 0.8;
+use_VTI_alpha = false;
+alpha_xx_val = alpha_iso;    % if use_VTI_alpha=true, set these
+alpha_zz_val = alpha_iso;
+alpha_xz_val = 0.0;
+
+% --- Elastic stiffness (VTI via Thomsen; default isotropic) ---
+Vp0 = 3000; Vs0 = 1500;      % [m/s]
+epsV = 0.0; delV = 0.0; gamV = 0.0;  % Thomsen anisotropy (VTI)
+[c11, c33, c55, c13] = thomsen_to_stiffness(rho, Vp0, Vs0, epsV, delV, gamV);
+
+% --- Grid design from diffusion length ---
+ppell_min        = 15;       % min points-per-diffusion-length
+resolution_mode  = 'worstcase'; % 'worstcase' or 'axiswise' (axiswise: Bxz≈0)
+
+% --- Sponge/ABL ---
+abl_ell_thickness = 3.0;     % sponge thickness = abl_ell_thickness * ell_ref
+eta_max_factor_mech = 1.0;   % mechanical sponge strength (complex density)
+eta_max_factor_pres = 0.5;   % pressure sponge strength (imag mass-term)
+eps_rel           = 1e-8;    % small uniform imaginary term (stability)
+
+% --- Source terms ---
+% Mechanical body force (vector) and fluid injection q (scalar):
+use_point_force = true;
+pol = [1, 0];                % force polarization [fx, fz]; point at center
+% Pressure RHS q: centered Gaussian injection
+gauss_sigma_per_ell = 1/6;   % σ ≈ ell_ref/6 (clamped to ≥2 grid steps)
+
+% --- GMRES ---
+restart = 60; tol = 1e-6; maxit = 400;
+
+% --- Elastic preconditioner reference (isotropic) ---
+rho_ref = 2500; Vp_ref = 3000; Vs_ref = 1500;
+
+%% ---------------------- DERIVE DIFFUSION LENGTH & GRID -------------------
+assert(omega>0, 'omega must be > 0.');
+
+% Mobility tensor (homogeneous maps)
+if use_VTI_B
+    Bxx_h = Bxx_val; Bzz_h = Bzz_val; Bxz_h = Bxz_val;
+else
+    Bxx_h = B_iso;   Bzz_h = B_iso;   Bxz_h = 0.0;
+end
+
+% Alpha tensor (homogeneous maps)
+if use_VTI_alpha
+    Axx_h = alpha_xx_val; Azz_h = alpha_zz_val; Axz_h = alpha_xz_val;
+else
+    Axx_h = alpha_iso;    Azz_h = alpha_iso;    Axz_h = 0.0;
+end
+
+% Diffusion lengths (indicative) from (M,B,ω)
+[ell_x, ell_z, ell_min] = diffusion_lengths(M_val, Bxx_h, Bzz_h, Bxz_h, omega);
+ell_ref = ell_min;  % conservative length scale for grid/sponge/source
+
+% Choose Δx, Δz from ppell_min and ell (worstcase or axiswise)
+switch lower(resolution_mode)
+    case 'axiswise'
+        dx_target = max(ell_x / ppell_min, eps);
+        dz_target = max(ell_z / ppell_min, eps);
+    otherwise
+        dx_target = max(ell_min / ppell_min, eps);
+        dz_target = dx_target;
+end
+
+% Choose odd grid sizes to center sources
+Nx = make_odd( max(3, round(Lx / dx_target)) );
+Nz = make_odd( max(3, round(Lz / dz_target)) );
+dx = Lx / Nx; dz = Lz / Nz;
+
+% Axes and spectral grids
+xax = (0:Nx-1)*dx; zax = (0:Nz-1)*dz; [X, Z] = ndgrid(xax, zax);
+[KX, KZ] = build_k_grids(Nx, Nz, dx, dz);
+
+fprintf('Diffusion lengths [m]: ell_x=%.2f, ell_z=%.2f, ell_min=%.2f (f=%.3e Hz)\n', ell_x, ell_z, ell_min, f_hz);
+fprintf('Grid: Nx=%d, Nz=%d, dx=%.3f m, dz=%.3f m (ppell_x=%.1f, ppell_z=%.1f)\n', ...
+        Nx, Nz, dx, dz, ell_x/max(dx,eps), ell_z/max(dz,eps));
+
+%% ------------------------------- FIELDS ----------------------------------
+% Homogeneous maps (replace with heterogeneous later if desired)
+Mfield  = M_val  * ones(Nx, Nz);
+rho_map = rho     * ones(Nx, Nz);
+
+Bxx = Bxx_h * ones(Nx, Nz);
+Bzz = Bzz_h * ones(Nx, Nz);
+Bxz = Bxz_h * ones(Nx, Nz);  % symmetric: Bxz=Bzx
+
+Axx = Axx_h * ones(Nx, Nz);
+Azz = Azz_h * ones(Nx, Nz);
+Axz = Axz_h * ones(Nx, Nz);  % symmetric: α_xz=α_zx
+
+% Stiffness maps (VTI)
+C11 = c11 * ones(Nx, Nz);
+C33 = c33 * ones(Nx, Nz);
+C55 = c55 * ones(Nx, Nz);
+C13 = c13 * ones(Nx, Nz);
+
+%% ------------------------------- SOURCES ---------------------------------
+sx = ceil((Nx+1)/2); sz = ceil((Nz+1)/2);
+Spt = zeros(Nx, Nz); Spt(sx, sz) = 1;
+
+fx = zeros(Nx, Nz); fz = zeros(Nx, Nz);
+if use_point_force
+    fx = pol(1) * Spt;
+    fz = pol(2) * Spt;
+end
+
+% Gaussian injection for q
+sigma_tgt = ell_ref * gauss_sigma_per_ell;
+sigma_x = max(2*dx, sigma_tgt);
+sigma_z = max(2*dz, sigma_tgt);
+x0 = xax(sx); z0 = zax(sz);
+q = exp( - ((X - x0).^2)/(2*sigma_x^2) - ((Z - z0).^2)/(2*sigma_z^2) );
+q = q / max(abs(q(:)));
+
+%% -------------------------------- SPONGE ---------------------------------
+% Mechanical sponge via complex density: rho_eff = rho + i*sign_t*eta_rho
+thick_m = abl_ell_thickness * ell_ref;
+[eta_profile, ~] = build_sponge_quadratic_with_t(Nx, Nz, Lx, Lz, thick_m);
+eta_rho = eta_max_factor_mech * mean(rho_map(:)) * eta_profile + eps_rel * rho_map;
+
+% Pressure sponge as i*sign_t*eta_p * p
+eta_char = mean( omega ./ max(Mfield,eps), 'all' );
+eta_p = eta_max_factor_pres * eta_char * eta_profile + eps_rel * eta_char;
+
+%% -------------------------- PACK / UNPACK --------------------------------
+N  = Nx * Nz;
+packUP   = @(u1,u2,p) [u1(:); u2(:); p(:)];
+unpackUP = @(x) deal( reshape(x(1:N),Nx,Nz), reshape(x(N+1:2*N),Nx,Nz), reshape(x(2*N+1:3*N),Nx,Nz) );
+
+% RHS vector
+b = packUP(fx, fz, q);
+
+%% ----------------------------- OPERATOR ----------------------------------
+Afun = @(x) applyA_biot_coupled(x, Nx, Nz, KX, KZ, ...
+    rho_map, eta_rho, C11, C33, C55, C13, ...
+    Mfield, Bxx, Bzz, Bxz, Axx, Azz, Axz, rho_f, omega, sign_t, eta_p, ...
+    packUP, unpackUP);
+
+%% --------------------------- PRECONDITIONER ------------------------------
+% Elastic isotropic spectral preconditioner (as in your VTI code)
+rho0_eff = rho_ref + 1i*sign_t*mean(eta_rho(:));
+mu0  = rho_ref * Vs_ref^2;
+lambda0 = rho_ref * (Vp_ref^2 - 2*Vs_ref^2);
+
+Minv_elastic = @(r_u_vec) applyMinv_isoFFT_elastic(r_u_vec, Nx, Nz, KX, KZ, ...
+                        omega, rho0_eff, lambda0, mu0);
+
+% Pressure spectral preconditioner (constant coeffs)
+M0   = mean(Mfield(:));
+B0xx = mean(Bxx(:)); B0zz = mean(Bzz(:)); B0xz = mean(Bxz(:));
+eta0 = mean(eta_p(:));
+Minv_pressure = @(r_p_vec) applyMinv_pressure_isoFFT(r_p_vec, Nx, Nz, KX, KZ, ...
+                        M0, B0xx, B0zz, B0xz, omega, sign_t, eta0, (1e-14)*(1+1i));
+
+% Block-diagonal preconditioner
+Mprec = @(r_vec) block_precond(r_vec, Nx, Nz, Minv_elastic, Minv_pressure);
+
+%% --------------------------------- GMRES ---------------------------------
+x0 = zeros(3*N,1);
+[xsol, flag, relres, iter, resvec] = gmres(Afun, b, 60, tol, maxit, Mprec, [], x0);
+if numel(iter) == 2, total_iters = (iter(1)-1)*60 + iter(2); else, total_iters = iter; end
+[u1, u2, p] = unpackUP(xsol);
+
+fprintf('GMRES: flag=%d, relres=%.2e, total iters=%d\n', flag, relres, total_iters);
+
+%% ------------------------------- FIGURES ---------------------------------
+figure('Name','Biot coupled solution: displacement & pressure'); colormap parula
+
+subplot(2,3,1)
+imagesc(xax, zax, abs(real(u1)).'); axis equal tight; set(gca,'YDir','normal')
+colorbar; title('|Re(U_x)|'); xlabel('X (m)'); ylabel('Z (m)')
+
+subplot(2,3,2)
+imagesc(xax, zax, abs(real(u2)).'); axis equal tight; set(gca,'YDir','normal')
+colorbar; title('|Re(U_z)|'); xlabel('X (m)'); ylabel('Z (m)')
+
+subplot(2,3,3)
+imagesc(xax, zax, abs(real(p)).'); axis equal tight; set(gca,'YDir','normal')
+colorbar; title('|Re(p)|'); xlabel('X (m)'); ylabel('Z (m)')
+
+subplot(2,3,4)
+imagesc(xax, zax, abs(imag(u1)).'); axis equal tight; set(gca,'YDir','normal')
+colorbar; title('|Im(U_x)|'); xlabel('X (m)'); ylabel('Z (m)')
+
+subplot(2,3,5)
+imagesc(xax, zax, abs(imag(u2)).'); axis equal tight; set(gca,'YDir','normal')
+colorbar; title('|Im(U_z)|'); xlabel('X (m)'); ylabel('Z (m)')
+
+subplot(2,3,6)
+imagesc(xax, zax, abs(imag(p)).'); axis equal tight; set(gca,'YDir','normal')
+colorbar; title('|Im(p)|'); xlabel('X (m)'); ylabel('Z (m)')
+
+figure('Name','GMRES Convergence (coupled Biot)')
+k = 0:numel(resvec)-1;
+if ~isempty(resvec) && resvec(1) ~= 0
+    semilogy(k, resvec/resvec(1), 'o-','LineWidth',1.2);
+else
+    semilogy(k, resvec/max(resvec(1),eps), 'o-','LineWidth',1.2);
+end
+grid on; hold on; yline(tol,'r--','Tolerance'); hold off
+xlabel('Iteration'); ylabel('||r_k|| / ||r_0||');
+title(sprintf('GMRES: flag=%d, relres=%.2e, iters=%d', flag, relres, total_iters));
+
+% =========================================================================
+%                                FUNCTIONS
+% =========================================================================
+
+function y_vec = applyA_biot_coupled(x_vec, Nx, Nz, KX, KZ, ...
+    rho, eta_rho, c11, c33, c55, c13, ...
+    Mfield, Bxx, Bzz, Bxz, Axx, Azz, Axz, rho_f, omega, sign_t, eta_p, ...
+    packUP, unpackUP)
+% Matrix-free application of the coupled Biot block operator:
+% y = [y_u; y_p] where:
+%   y_u = -ω^2(ρ+i sign_t η_rho)u + i sign_t ω^3 ρ_f^2 (B·u) - div(σ)
+%         - ∇·(α p) + i sign_t ω ρ_f (B·∇p)
+%   y_p = i sign_t ω (p./M) + i sign_t η_p p - ∇·(B∇p)
+%         + i sign_t ω ∇·(α·u) + ω^2 ρ_f ∇·(B·u)
+
+    [u1, u2, p] = unpackUP(x_vec);
+
+    % ----- Elastic strain/stress/div -----
+    U1k = fft2(u1); U2k = fft2(u2);
+    du1dx = ifft2(1i*KX .* U1k); du1dz = ifft2(1i*KZ .* U1k);
+    du2dx = ifft2(1i*KX .* U2k); du2dz = ifft2(1i*KZ .* U2k);
+    e_xx = du1dx; e_zz = du2dz; g_xz = du2dx + du1dz;
+
+    s_xx = c11 .* e_xx + c13 .* e_zz;
+    s_zz = c13 .* e_xx + c33 .* e_zz;
+    s_xz = c55 .* g_xz;
+
+    Sxxk = fft2(s_xx); Szzk = fft2(s_zz); Sxzk = fft2(s_xz);
+    div1 = ifft2(1i*KX .* Sxxk + 1i*KZ .* Sxzk);
+    div2 = ifft2(1i*KX .* Sxzk + 1i*KZ .* Szzk);
+
+    % ----- Inertial terms -----
+    rho_eff_mech = rho + 1i*sign_t*eta_rho; % complex density sponge
+    y1 = - (omega^2) * (rho_eff_mech) .* u1 - div1;
+    y2 = - (omega^2) * (rho_eff_mech) .* u2 - div2;
+
+    % Add dynamic Biot inertia: + i sign_t ω^3 ρ_f^2 (B·u)
+    Bu_x = Bxx .* u1 + Bxz .* u2;
+    Bu_z = Bxz .* u1 + Bzz .* u2;
+    y1 = y1 + (1i*sign_t) * (omega^3) * (rho_f^2) .* Bu_x;
+    y2 = y2 + (1i*sign_t) * (omega^3) * (rho_f^2) .* Bu_z;
+
+    % ----- Coupling in displacement: -∇·(α p) + i sign_t ω ρ_f B·∇p -----
+    Pk  = fft2(p);
+    dpx = ifft2(1i*KX .* Pk);
+    dpz = ifft2(1i*KZ .* Pk);
+
+    % -∇·(α p): tensor divergence with components
+    Apx_x = Axx .* p; Apx_z = Axz .* p;   % T_xx = α_xx p, T_xz = α_xz p
+    Apz_x = Axz .* p; Apz_z = Azz .* p;   % T_zx = α_xz p, T_zz = α_zz p
+    Txxk = fft2(Apx_x); Txzk = fft2(Apx_z);
+    Tzxk = fft2(Apz_x); Tzzk = fft2(Apz_z);
+    div_alpha_p_x = ifft2(1i*KX .* Txxk + 1i*KZ .* Txzk);
+    div_alpha_p_z = ifft2(1i*KX .* Tzxk + 1i*KZ .* Tzzk);
+
+    y1 = y1 - div_alpha_p_x;
+
+    y2 = y2 - div_alpha_p_z;
+
+    % i sign_t ω ρ_f (B·∇p)
+    Bgradp_x = Bxx .* dpx + Bxz .* dpz;
+    Bgradp_z = Bxz .* dpx + Bzz .* dpz;
+    y1 = y1 + (1i*sign_t) * omega * rho_f .* Bgradp_x;
+    y2 = y2 + (1i*sign_t) * omega * rho_f .* Bgradp_z;
+
+    % ----- Pressure block -----
+    % -∇·(B∇p) + i sign_t ω (p./M) + i sign_t η_p p
+    Vxk = fft2(Bgradp_x); Vzk = fft2(Bgradp_z);
+    div_Bgradp = ifft2(1i*KX .* Vxk + 1i*KZ .* Vzk);
+
+    mass_p = (1i*sign_t) * omega * (p ./ max(Mfield, eps));
+    sponge_p = (1i*sign_t) * eta_p .* p;
+
+    % Coupling terms: i sign_t ω ∇·(α·u) + ω^2 ρ_f ∇·(B·u)
+    % α·u
+    Au_x = Axx .* u1 + Axz .* u2;
+    Au_z = Axz .* u1 + Azz .* u2;
+    Aukx = fft2(Au_x); Aukz = fft2(Au_z);
+    div_Au = ifft2(1i*KX .* Aukx + 1i*KZ .* Aukz);
+
+    % B·u (already Bu_x, Bu_z)
+    Bukx = fft2(Bu_x); Bukz = fft2(Bu_z);
+    div_Bu = ifft2(1i*KX .* Bukx + 1i*KZ .* Bukz);
+
+    y3 = mass_p + sponge_p - div_Bgradp + (1i*sign_t) * omega * div_Au + (omega^2)*rho_f * div_Bu;
+
+    y_vec = packUP(y1, y2, y3);
+end
+
+function z_vec = block_precond(r_vec, Nx, Nz, Minv_elastic, Minv_pressure)
+% Split r = [r_u1; r_u2; r_p] and apply block-diagonal preconditioner
+    N = Nx*Nz;
+    ru = [r_vec(1:N); r_vec(N+1:2*N)];
+    rp = r_vec(2*N+1:3*N);
+    zu = Minv_elastic(ru);
+    zp = Minv_pressure(rp);
+    z_vec = [zu; zp];
+end
+
+function z = applyMinv_isoFFT_elastic(r_u_vec, Nx, Nz, KX, KZ, omega, rho0_eff, lambda0, mu0)
+% Isotropic elastic spectral preconditioner (2x2 block)
+% A(k) = -ω^2 ρ0 I + μ0 |k|^2 I + (λ0+μ0) k k^T
+    N = Nx*Nz;
+    r1 = reshape(r_u_vec(1:N), Nx, Nz);
+    r2 = reshape(r_u_vec(N+1:2*N), Nx, Nz);
+    R1 = fft2(r1); R2 = fft2(r2);
+
+    kx = KX; kz = KZ; k2 = kx.^2 + kz.^2;
+    a = - (omega^2) * rho0_eff + mu0 * k2;
+    b = (lambda0 + mu0);
+    tiny = (1e-14)*(1+1i);
+    a_safe = a; a_safe(abs(a_safe) < 1e-14) = a_safe(abs(a_safe) < 1e-14) + tiny;
+
+    Rdot = kx .* R1 + kz .* R2;
+    denom = a_safe .* (a_safe + b * k2);
+    denom(abs(denom) < 1e-14) = denom(abs(denom) < 1e-14) + tiny;
+    coef = b ./ denom;
+
+    Z1_hat = (R1 ./ a_safe) - coef .* kx .* Rdot;
+    Z2_hat = (R2 ./ a_safe) - coef .* kz .* Rdot;
+
+    z1 = ifft2(Z1_hat); z2 = ifft2(Z2_hat);
+    z = [z1(:); z2(:)];
+end
+
+function z_vec = applyMinv_pressure_isoFFT(r_vec, Nx, Nz, KX, KZ, M0, B0xx, B0zz, B0xz, ...
+                                           omega, sign_t, eta_p0, eps_shift)
+% Pressure spectral preconditioner: 1 / (i sign_t ω/M0 + k^T B0 k + i sign_t η_p0)
+    r = reshape(r_vec, Nx, Nz);
+    Rk = fft2(r);
+    kx = KX; kz = KZ;
+    symB = B0xx.*(kx.^2) + 2*B0xz.*(kx.*kz) + B0zz.*(kz.^2);
+    sym0 = 1i*sign_t*omega/max(M0,eps) + symB + 1i*sign_t*eta_p0;
+    tiny = (1e-14)*(1+1i);
+    mask = (abs(sym0) < 1e-14);
+    sym0(mask) = sym0(mask) + tiny + eps_shift;
+    Zk = Rk ./ sym0;
+    z = ifft2(Zk);
+    z_vec = z(:);
+end
+
+function [ell_x, ell_z, ell_min] = diffusion_lengths(M, Bxx, Bzz, Bxz, omega)
+% Axis-wise & worst-case diffusion lengths for homogeneous B tensor.
+% For isotropy: ell = sqrt(2 M B / ω).
+    ell_x = sqrt( max(2*M*Bxx/omega, 0) );
+    ell_z = sqrt( max(2*M*Bzz/omega, 0) );
+    % Worst-case via smallest eigenvalue of B:
+    [lam_min, ~] = eigvals2_sym(Bxx, Bzz, Bxz);
+    ell_min = sqrt( max(2*M*lam_min/omega, 0) );
+end
+
+function [lam_min, lam_max] = eigvals2_sym(a, c, b)
+% Eigenvalues of 2x2 symmetric matrix [a b; b c]
+    tr = a + c;
+    detv = a.*c - b.*b;
+    disc = max(tr.^2/4 - detv, 0);
+    root = sqrt(disc);
+    lam1 = tr/2 - root;
+    lam2 = tr/2 + root;
+    lam_min = min(lam1, lam2);
+    lam_max = max(lam1, lam2);
+end
+
+function [KX, KZ] = build_k_grids(Nx, Nz, dx, dz)
+    kx_vec = (2*pi/(Nx*dx)) * [0:ceil(Nx/2)-1, -floor(Nx/2):-1];
+    kz_vec = (2*pi/(Nz*dz)) * [0:ceil(Nz/2)-1, -floor(Nz/2):-1];
+    [KX, KZ] = ndgrid(kx_vec, kz_vec);
+end
+
+function [eta, tau] = build_sponge_quadratic_with_t(Nx, Nz, Lx, Lz, thickness_m)
+% tau: boundary ramp (0 in interior, 1 at boundary over thickness_m)
+% eta: quadratic sponge profile = tau.^2
+    x = (0:Nx-1) * (Lx/Nx);
+    z = (0:Nz-1) * (Lz/Nz);
+    [Xg, Zg] = ndgrid(x, z);
+    d_left = Xg; d_right = Lx - Xg; d_top = Zg; d_bottom = Lz - Zg;
+    dmin = min(min(d_left, d_right), min(d_top, d_bottom));
+    tau = max(0, min(1, (thickness_m - dmin) / max(thickness_m, eps)));
+    eta = tau.^2;
+end
+
+function [c11,c33,c55,c13] = thomsen_to_stiffness(rho,Vp0,Vs0,epsilon,delta,~)
+% Thomsen (VTI) to stiffness: c11,c33,c55,c13 (Voigt, engineering shear)
+% A=c11, C=c33, L=c55, F=c13; delta=((F+L)^2-(C-L)^2)/(2*C*(C-L))
+    A = rho*Vp0^2*(1 + 2*epsilon);
+    C = rho*Vp0^2;
+    L = rho*Vs0^2;
+    CL = C - L;
+    F = -L + sqrt(max(CL.*(CL + 2*C*delta), 0));
+    c11 = A; c33 = C; c55 = L; c13 = F;
+end
+
+function n_odd = make_odd(n)
+% Ensure odd integer (>= 3)
+    n_odd = max(3, n + mod(n+1,2));
+end
