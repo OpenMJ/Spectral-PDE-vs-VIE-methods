@@ -1,0 +1,597 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% biot_fd_snapshots_v2.m
+%
+% Self-contained pseudo-spectral frequency-domain Biot solver + 
+% time-domain snapshots via positive-frequency synthesis (Ricker source).
+%
+% Includes low-hanging fruits for robust time snapshots:
+%   - ppw_min=30, thicker sponge (12 λS), sigma_src_cells=3
+%   - unit-integral spatial source (stable broadband amplitude)
+%   - dt=0.0025, Nt=4096 (high Nyquist and fine df)
+%   - essential band 1%..99%
+%   - fixed eta_p across frequency (avoid band-dependent damping)
+%   - GMRES tol=1e-6, maxit=150, warm-start across frequencies
+%
+% Usage:
+%   >> biot_fd_snapshots_v2
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+clearvars; close all; clc;
+
+%% =========================== USER PARAMETERS ============================
+% ----- Quick toggle: set true for a very fast preview (coarser everything)
+FAST_PREVIEW = false;
+
+% Domain
+Lx = 1000;      % [m]
+Lz = 1000;      % [m]
+
+% Time convention (keep 'em1' to match pseudo-spectral signs, e^{-i ω t})
+timeConvention = 'em1';             
+sign_t = +1; if strcmpi(timeConvention,'ep1'), sign_t = -1; end
+
+% Elastic (isotropic defaults; VTI supported if you flip use_VTI)
+rho = 2200;                         % [kg/m^3]
+Vp0 = 3000;                         % [m/s]
+Vs0 = 1500;                         % [m/s]
+use_VTI = false;
+eps_vti = 0.1; del_vti = 0.05; gam_vti = 0.2; %#ok<NASGU>
+
+% Biot / poroelastic coupling
+M_val      = 1.5e9;                 % [Pa]
+alpha_iso  = 0.5;                   % scalar α
+rho_f      = 1000;                  % [kg/m^3]
+B_iso      = 1e-7;                  % [m^2/(Pa·s)] isotropic mobility
+
+% Frequency for reference (harmonic) and for sponge thickness
+f0   = 5.0;                         % [Hz] Ricker center
+f_hz = f0;                          % reference harmonic
+omega_ref = 2*pi*f_hz;
+
+% Grid design (spatial)
+ppw_min = 30;                       % min pts per S-wavelength  (↑ safer)
+abs_thickness_wl = 12.0;            % sponge thickness in S-wavelengths
+sigma_src_cells = 3;                % Gaussian source half-width in cells (↑ safer)
+
+% Sponge factors
+eta_max_factor_u   = 1.0;
+eps_rel_elastic    = 1e-6;
+eta_max_factor_p   = 0.3;
+eps_rel_pressure   = 1e-8;
+
+% GMRES
+restart = 100; tol = 1e-6; maxit = 150;
+
+% Source polarization (body force in displacement eqs)
+pol = [1, 0];                       % [fx, fz]
+
+% Time-snapshot synthesis (Ricker + positive freqs)
+mode = 'snapshots';                 % 'snapshots' or 'mp4'
+% mode = 'mp4';
+show_fields = 'all';                % 'ux' | 'uz' | 'p' | 'all'
+n_frames = 10;                      % if 'snapshots' -> forced to 5
+dt  = 0.0025;                       % [s] high Nyquist
+Nt  = 4096;                         % even; fine df
+t0  = 0.02;                         % Ricker center [s]
+band_lo = 0.01; band_hi = 0.99;     % essential band (1%..99%)
+
+% Spatial source normalization: 'integral' (recommended) or 'peak'
+source_normalization = 'integral';
+
+% Optional: single-frequency harmonic demo at f0
+do_harmonic_demo = false;
+
+% -------- Fast preview override --------
+if FAST_PREVIEW
+    ppw_min = 20;
+    abs_thickness_wl = 8;
+    sigma_src_cells = 2;
+    dt = 0.005;
+    Nt = 1024;
+    band_lo = 0.05; band_hi = 0.95;
+    tol = 1e-4; maxit = 60;
+end
+
+%% =========================== GRID & WAVENUMBERS =========================
+lambda_s = Vs0 / max(f_hz, eps);
+dx = lambda_s / ppw_min; dz = dx;
+
+Nx = make_odd(round(Lx / dx));
+Nz = make_odd(round(Lz / dz));
+dx = Lx / Nx; dz = Lz / Nz;              % snap to domain
+
+xax = (0:Nx-1)*dx; 
+zax = (0:Nz-1)*dz;
+[X, Z] = ndgrid(xax, zax);
+
+[KX, KZ] = build_k_grids(Nx, Nz, dx, dz);
+KK2 = KX.^2 + KZ.^2;
+
+fprintf('Grid: Nx=%d, Nz=%d, dx=%.3f m, dz=%.3f m, PPW_S≈%.1f\n', ...
+        Nx, Nz, dx, dz, lambda_s/max(dx,eps));
+
+%% ============================ ELASTIC MEDIUM ============================
+if ~use_VTI
+    mu  = rho * Vs0^2;
+    lam = rho * (Vp0^2 - 2*Vs0^2);
+    c11 = (lam + 2*mu) * ones(Nx, Nz);
+    c33 = c11;
+    c55 = mu * ones(Nx, Nz);
+    c13 = lam * ones(Nx, Nz);
+else
+    [c11_1,c33_1,c55_1,c13_1] = thomsen_to_stiffness(rho,Vp0,Vs0,eps_vti,del_vti,0);
+    c11 = c11_1 * ones(Nx, Nz);
+    c33 = c33_1 * ones(Nx, Nz);
+    c55 = c55_1 * ones(Nx, Nz);
+    c13 = c13_1 * ones(Nx, Nz);
+end
+
+%% ========================== POROELASTIC FIELDS ==========================
+alpha = struct();
+alpha.xx = alpha_iso * ones(Nx, Nz);
+alpha.zz = alpha_iso * ones(Nx, Nz);
+alpha.xz = zeros(Nx, Nz);
+
+Bxx = B_iso * ones(Nx, Nz);
+Bzz = B_iso * ones(Nx, Nz);
+Bxz = zeros(Nx, Nz);
+
+Mfield = M_val * ones(Nx, Nz);
+
+%% ================================ SOURCES ===============================
+% Gaussian at domain center
+sx = ceil((Nx+1)/2); sz = ceil((Nz+1)/2);
+S = gaussian_point(Nx, Nz, sx, sz, sigma_src_cells);
+switch lower(source_normalization)
+    case 'integral'
+        S = S / (sum(S(:)) * dx * dz); % unit integral (recommended)
+    case 'peak'
+        S = S / max(S(:));             % unit peak (legacy)
+    otherwise
+        error('source_normalization must be ''integral'' or ''peak''');
+end
+fx = pol(1) * S;
+fz = pol(2) * S;
+% No direct pressure source
+
+%% ========================== SPONGE / ABSORBING ==========================
+% Elastic sponge via complex density (fixed over band)
+Vs_min = Vs0; lambda_s_min = Vs_min / max(f_hz, eps);
+thickness_m_el = abs_thickness_wl * lambda_s_min;
+[eta_profile_el, ~] = build_sponge_quadratic_with_t(Nx, Nz, Lx, Lz, thickness_m_el);
+eta_rho = eta_max_factor_u * rho * eta_profile_el + eps_rel_elastic * rho;
+rho_eff = rho + 1i * sign_t * eta_rho;
+
+% Pressure sponge shape only (we will FIX its scale across band at f0)
+thickness_m_p = thickness_m_el;
+[eta_profile_p, ~] = build_sponge_quadratic_with_t(Nx, Nz, Lx, Lz, thickness_m_p);
+
+% Fix eta_p at reference frequency (avoids band-dependent damping)
+eta_char_p_ref = mean(omega_ref ./ Mfield, 'all');
+eta_p_fixed = eta_max_factor_p * eta_char_p_ref * eta_profile_p + ...
+              eps_rel_pressure * eta_char_p_ref;
+
+%% ============== PACK/UNPACK & MONOLITHIC OPERATOR (closures) ============
+Ngrid  = Nx*Nz;
+pack_u    = @(u1,u2) [u1(:); u2(:)];
+unpack_u  = @(x) deal(reshape(x(1:Ngrid),Nx,Nz), reshape(x(Ngrid+1:2*Ngrid),Nx,Nz));
+pack_up   = @(u1,u2,p) [u1(:); u2(:); p(:)];
+unpack_up = @(x) deal(reshape(x(1:Ngrid),Nx,Nz), reshape(x(Ngrid+1:2*Ngrid),Nx,Nz), reshape(x(2*Ngrid+1:3*Ngrid),Nx,Nz));
+
+%% ============================== HARMONIC DEMO ===========================
+if do_harmonic_demo
+    Afun_ref = @(x) applyA_biot_coupled( ...
+                x, Nx, Nz, KX, KZ, KK2, ...
+                rho_eff, c11, c33, c55, c13, ...
+                alpha, Mfield, Bxx, Bzz, Bxz, ...
+                rho_f, omega_ref, sign_t, eta_p_fixed, pack_up, unpack_up);
+
+    rho0_eff = mean(rho_eff(:));
+    mu0  = rho * Vs0^2;
+    lam0 = rho * (Vp0^2 - 2*Vs0^2);
+    Mprec_u_ref = @(r_u_vec) applyMinv_isoFFT_u( ...
+                       r_u_vec, Nx, Nz, KX, KZ, KK2, omega_ref, rho0_eff, lam0, mu0, pack_u, unpack_u);
+
+    M0    = mean(Mfield(:));
+    B0xx  = mean(Bxx(:)); B0zz = mean(Bzz(:)); B0xz = mean(Bxz(:));
+    eta0_ref  = mean(eta_p_fixed(:));
+    eps_shift = (1e-14) * (1+1i);
+    Mprec_p_ref = @(r_p_vec) applyMinv_pressure_isoFFT( ...
+                       r_p_vec, Nx, Nz, KX, KZ, M0, B0xx, B0zz, B0xz, omega_ref, sign_t, eta0_ref, eps_shift);
+
+    Mprec_ref = @(r_vec) block_prec_apply(r_vec, Nx, Nz, Mprec_u_ref, Mprec_p_ref);
+
+    b_ref = [fx(:); fz(:); zeros(Ngrid,1)];
+    x0_ref = zeros(3*Ngrid,1);
+    [xsol_ref, flag_ref, relres_ref, iter_ref, resvec_ref] = gmres(Afun_ref, b_ref, restart, tol, maxit, Mprec_ref, [], x0_ref);
+    if numel(iter_ref)==2
+    total_iters_ref = (iter_ref(1)-1)*restart + iter_ref(2);
+else
+    total_iters_ref = iter_ref;
+end
+    
+    [u1_ref, u2_ref, p_ref] = unpack_up(xsol_ref);
+    fprintf('Harmonic GMRES (f0=%.2f Hz): flag=%d, relres=%.2e, iters=%d\n', f0, flag_ref, relres_ref, total_iters_ref);
+
+    figure('Name','Harmonic fields'); colormap parula
+    subplot(2,3,1); imagesc(xax, zax, real(u1_ref).'); axis image; set(gca,'YDir','normal'); colorbar; title('Re(U_x)')
+    subplot(2,3,2); imagesc(xax, zax, real(u2_ref).'); axis image; set(gca,'YDir','normal'); colorbar; title('Re(U_z)')
+    subplot(2,3,3); imagesc(xax, zax, real(p_ref ).'); axis image; set(gca,'YDir','normal'); colorbar; title('Re(p)')
+    subplot(2,3,4); imagesc(xax, zax, imag(u1_ref).'); axis image; set(gca,'YDir','normal'); colorbar; title('Im(U_x)')
+    subplot(2,3,5); imagesc(xax, zax, imag(u2_ref).'); axis image; set(gca,'YDir','normal'); colorbar; title('Im(U_z)')
+    subplot(2,3,6); imagesc(xax, zax, imag(p_ref ).'); axis image; set(gca,'YDir','normal'); colorbar; title('Im(p)')
+
+    figure('Name','GMRES (harmonic)')
+    kk = 0:numel(resvec_ref)-1;
+    base = resvec_ref(1); if base==0, base=max(base,eps); end
+    semilogy(kk, resvec_ref/base, 'o-','LineWidth',1.2); grid on; hold on; yline(tol,'r--'); hold off
+    xlabel('Iteration'); ylabel('||r_k||/||r_0||'); title('Harmonic GMRES convergence');
+end
+
+%% ==================== TIME-DOMAIN SNAPSHOTS (FD SYNTHESIS) ==============
+if strcmpi(mode,'snapshots'), n_frames = 5; end
+
+% Temporal grid
+if mod(Nt,2) ~= 0, error('Nt must be even'); end
+T  = Nt * dt; 
+Nf = Nt/2 + 1;
+t  = (0:Nt-1).' * dt;
+
+% Ricker & positive-frequency spectrum
+ricker = ricker_time(f0, t, t0);
+S_full = fft(ricker, Nt);
+S_pos  = S_full(1:Nf);
+freqs  = (0:(Nf-1)).' / (Nt*dt);   % Hz
+
+% Essential band
+mag = abs(S_pos); energy = mag.^2;
+cumE = cumsum(energy) / max(sum(energy), eps);
+k_low  = find(cumE >= band_lo, 1, 'first'); if isempty(k_low),  k_low=1; end
+k_high = find(cumE >= band_hi, 1, 'first'); if isempty(k_high), k_high=Nf; end
+
+fprintf('Temporal FFT: Nyquist=%.3f Hz, df=%.6f Hz, band [%d..%d]=[%.3f..%.3f] Hz\n', ...
+        1/(2*dt), freqs(2)-freqs(1), k_low, k_high, freqs(k_low), freqs(k_high));
+
+% Snapshot times (visual guidance using Vs0)
+r_frac = linspace(0.05, 0.95, n_frames);
+c_ref  = Vs0;
+maxR   = 0.5 * sqrt(Lx^2 + Lz^2);
+snapshot_times = t0 + (r_frac * maxR) / max(c_ref, eps);
+snapshot_times(snapshot_times >= T) = 0.9*T;
+n_snap = numel(snapshot_times);
+n_indices = mod(floor(snapshot_times / dt + 0.5), Nt); % robust integer indices
+
+fprintf('Will synthesize %d frames at times (s): %s\n', n_snap, mat2str(snapshot_times,6));
+
+% Base RHS (spatial) – multiply by S_pos(k) per frequency
+b_base = [fx(:); fz(:); zeros(Ngrid,1)];
+
+% Accumulators
+snap_u1 = zeros(n_snap, Nx, Nz);
+snap_u2 = zeros(n_snap, Nx, Nz);
+snap_p  = zeros(n_snap, Nx, Nz);
+
+% Frequency sweep (each bin uses the same operator form; ω varies; η_p fixed)
+ticAll = tic;
+x0_fd = zeros(3*Ngrid,1);    % warm start across frequencies
+
+for k = k_low-1 : k_high-1
+    fk    = freqs(k+1);
+    omega = 2*pi*fk;
+    Sk    = S_pos(k+1);
+
+    if (fk == 0) || (abs(Sk) < 1e-14)
+        Xk_u1 = zeros(Nx,Nz); Xk_u2 = zeros(Nx,Nz); Xk_p = zeros(Nx,Nz);
+    else
+        % Monolithic operator at ω with FIXED eta_p (shape & scale)
+        Afun_k = @(x) applyA_biot_coupled( ...
+                    x, Nx, Nz, KX, KZ, KK2, ...
+                    rho_eff, c11, c33, c55, c13, ...
+                    alpha, Mfield, Bxx, Bzz, Bxz, ...
+                    rho_f, omega, sign_t, eta_p_fixed, pack_up, unpack_up);
+
+        % Block preconditioner (ω-dependent symbols)
+        rho0_eff = mean(rho_eff(:));
+        mu0  = rho * Vs0^2;
+        lam0 = rho * (Vp0^2 - 2*Vs0^2);
+        Mprec_u_k = @(r_u_vec) applyMinv_isoFFT_u( ...
+                         r_u_vec, Nx, Nz, KX, KZ, KK2, omega, rho0_eff, lam0, mu0, pack_u, unpack_u);
+
+        M0    = mean(Mfield(:));
+        B0xx  = mean(Bxx(:)); B0zz = mean(Bzz(:)); B0xz = mean(Bxz(:));
+        eta0  = mean(eta_p_fixed(:));  % fixed
+        eps_shift = (1e-14) * (1+1i);
+        Mprec_p_k = @(r_p_vec) applyMinv_pressure_isoFFT( ...
+                         r_p_vec, Nx, Nz, KX, KZ, M0, B0xx, B0zz, B0xz, omega, sign_t, eta0, eps_shift);
+
+        Mprec_k = @(r_vec) block_prec_apply(r_vec, Nx, Nz, Mprec_u_k, Mprec_p_k);
+
+        % RHS for this bin
+        b_k = Sk * b_base;
+
+        % GMRES with warm start
+        [xsol_k, ~, ~, ~, ~] = gmres(Afun_k, b_k, restart, tol, maxit, Mprec_k, [], x0_fd);
+        x0_fd = xsol_k;   % warm-start next bin
+
+        % Unpack Fourier-domain fields
+        [Xk_u1, Xk_u2, Xk_p] = unpack_up(xsol_k);
+    end
+
+    % Positive-frequency accumulation (DC, Nyquist handled explicitly)
+    if k == 0
+        add_u1 = (1.0 / Nt) * real(Xk_u1);
+        add_u2 = (1.0 / Nt) * real(Xk_u2);
+        add_p  = (1.0 / Nt) * real(Xk_p);
+        for jj = 1:n_snap
+            snap_u1(jj,:,:) = squeeze(snap_u1(jj,:,:)) + add_u1;
+            snap_u2(jj,:,:) = squeeze(snap_u2(jj,:,:)) + add_u2;
+            snap_p(jj,:,:)  = squeeze(snap_p(jj,:,:))  + add_p;
+        end
+    elseif (k == Nt/2) && (mod(Nt,2) == 0)
+        for jj = 1:n_snap
+            n = n_indices(jj);
+            sgn = (-1)^n;
+            snap_u1(jj,:,:) = squeeze(snap_u1(jj,:,:)) + (1.0/Nt) * sgn * real(Xk_u1);
+            snap_u2(jj,:,:) = squeeze(snap_u2(jj,:,:)) + (1.0/Nt) * sgn * real(Xk_u2);
+            snap_p(jj,:,:)  = squeeze(snap_p(jj,:,:))  + (1.0/Nt) * sgn * real(Xk_p);
+        end
+    else
+        for jj = 1:n_snap
+            n = n_indices(jj);
+            phase = exp(2i * pi * k * n / Nt);
+            snap_u1(jj,:,:) = squeeze(snap_u1(jj,:,:)) + (2.0/Nt) * real( phase * Xk_u1 );
+            snap_u2(jj,:,:) = squeeze(snap_u2(jj,:,:)) + (2.0/Nt) * real( phase * Xk_u2 );
+            snap_p(jj,:,:)  = squeeze(snap_p(jj,:,:))  + (2.0/Nt) * real( phase * Xk_p  );
+        end
+    end
+
+    % Progress
+    if mod(k - (k_low-1) + 1, max(1,floor((k_high-k_low+1)/10))) == 0
+        fprintf('  processed %d / %d bins (k=%d, f=%.3f Hz)\n', k-(k_low-1)+1, (k_high-k_low+1), k, fk);
+    end
+end
+fprintf('Biot frequency loop finished in %.2f s\n', toc(ticAll));
+
+%% =========================== DISPLAY / WRITE MP4 ========================
+% Decide what to plot
+switch lower(show_fields)
+    case 'ux'
+        snaps = {snap_u1}; titles = {'u_x'}; fn = 'ux';
+    case 'uz'
+        snaps = {snap_u2}; titles = {'u_z'}; fn = 'uz';
+    case 'p'
+        snaps = {snap_p};  titles = {'p'};   fn = 'p';
+    case 'all'
+        snaps = {snap_u1, snap_u2, snap_p}; titles = {'u_x','u_z','p'}; fn = 'all';
+    otherwise
+        error('show_fields must be ux|uz|p|all');
+end
+ncols = numel(snaps);
+
+% Robust color limits per field
+vlims = cell(1,ncols);
+for c = 1:ncols
+    snapc = snaps{c};
+    vmax = prctile(abs(snapc(:)), 99.5); if vmax == 0, vmax = max(abs(snapc(:))); end
+    vlims{c} = [-vmax, vmax];
+end
+
+if strcmpi(mode, 'snapshots')
+    hf = figure('Name','Biot snapshots','NumberTitle','off','Color','w',...
+        'Units','normalized','Position',[0.03 0.08 0.94 0.65]);
+    tlo = tiledlayout(ncols, n_snap, 'Padding','compact','TileSpacing','compact'); %#ok<NASGU>
+    for c = 1:ncols
+        for j = 1:n_snap
+            nexttile;
+            data = squeeze(snaps{c}(j,:,:)).';
+            ax = gca;
+            imagesc(ax, xax, zax, data);
+            axis(ax,'image'); set(ax,'YDir','normal'); caxis(ax, vlims{c});
+            colormap(ax, redblue()); colorbar('peer', ax);
+            title(ax, sprintf('%s, t=%.3f s', titles{c}, snapshot_times(j)));
+            xlabel(ax,'x (m)'); ylabel(ax,'z (m)');
+        end
+    end
+    sgtitle('Time snapshots from FD Biot synthesis');
+    fprintf('Displayed %d x %d snapshots.\n', ncols, n_snap);
+
+elseif strcmpi(mode, 'mp4')
+    movie_filename = sprintf('biot_snapshots_%s.mp4', fn);
+    fps = 5;
+    vw = VideoWriter(movie_filename, 'MPEG-4'); vw.FrameRate = fps; vw.Quality = 90; open(vw);
+
+    hf = figure('Name','Biot snapshots MP4','NumberTitle','off','Color','w','Units','pixels','Position',[100 100 1200 500]);
+    for j = 1:n_snap
+        clf(hf);
+        for c = 1:ncols
+            ax = subplot(1,ncols,c,'Parent',hf);
+            data = squeeze(snaps{c}(j,:,:)).';
+            imagesc(ax, xax, zax, data); axis(ax,'image'); set(ax,'YDir','normal');
+            caxis(ax, vlims{c}); colormap(ax, redblue()); colorbar('peer', ax);
+            title(ax, sprintf('%s, t=%.3f s', titles{c}, snapshot_times(j)), 'Interpreter','none');
+            xlabel(ax,'x (m)'); ylabel(ax,'z (m)');
+        end
+        drawnow; writeVideo(vw, getframe(hf));
+        fprintf('  wrote frame %d / %d\n', j, n_snap);
+    end
+    close(vw); fprintf('MP4 written: %s (fps=%d)\n', movie_filename, fps);
+else
+    error('Unsupported mode (snapshots|mp4)');
+end
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%                              LOCAL FUNCTIONS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+function y = applyA_biot_coupled(x, Nx, Nz, KX, KZ, KK2, ...
+                                 rho_eff, c11, c33, c55, c13, ...
+                                 alpha, Mfield, Bxx, Bzz, Bxz, ...
+                                 rho_f, omega, sign_t, eta_p, pack_up, unpack_up)
+% Monolithic Biot operator A*[u;p] with full coupling (pseudo-spectral)
+    [u1, u2, p] = unpack_up(x);
+
+    % Elastic strain and stress
+    U1k = fft2(u1); U2k = fft2(u2);
+    du1dx = ifft2(1i*KX .* U1k); du1dz = ifft2(1i*KZ .* U1k);
+    du2dx = ifft2(1i*KX .* U2k); du2dz = ifft2(1i*KZ .* U2k);
+    e_xx = du1dx; e_zz = du2dz; g_xz = du2dx + du1dz;
+
+    s_xx = c11 .* e_xx + c13 .* e_zz;
+    s_zz = c13 .* e_xx + c33 .* e_zz;
+    s_xz = c55 .* g_xz;
+
+    Sxxk = fft2(s_xx); Szzk = fft2(s_zz); Sxzk = fft2(s_xz);
+    div1 = ifft2(1i*KX .* Sxxk + 1i*KZ .* Sxzk);
+    div2 = ifft2(1i*KX .* Sxzk + 1i*KZ .* Szzk);
+
+    % -div(α p)
+    Sxx_a = alpha.xx .* p;
+    Szz_a = alpha.zz .* p;
+    Sxz_a = alpha.xz .* p;
+    Sxx_a_k = fft2(Sxx_a); Szz_a_k = fft2(Szz_a); Sxz_a_k = fft2(Sxz_a);
+    div1_alpha = ifft2(1i*KX .* Sxx_a_k + 1i*KZ .* Sxz_a_k);
+    div2_alpha = ifft2(1i*KX .* Sxz_a_k + 1i*KZ .* Szz_a_k);
+    su_alpha1 = - div1_alpha;
+    su_alpha2 = - div2_alpha;
+
+    % -(i sign_t) ω ρ_f (B ∇p)
+    Pk  = fft2(p);
+    dpx = ifft2(1i*KX .* Pk);
+    dpz = ifft2(1i*KZ .* Pk);
+    vx_bp = Bxx .* dpx + Bxz .* dpz;
+    vz_bp = Bxz .* dpx + Bzz .* dpz;
+    su_bp1 = - (1i*sign_t) * omega * rho_f .* vx_bp;
+    su_bp2 = - (1i*sign_t) * omega * rho_f .* vz_bp;
+
+    % -ω^2 (i sign_t ω ρ_f^2) (B·u)
+    Bu_x = Bxx .* u1 + Bxz .* u2;
+    Bu_z = Bxz .* u1 + Bzz .* u2;
+    mass_Bu1 = - (1i*sign_t) * (omega^3) * (rho_f^2) .* Bu_x;
+    mass_Bu2 = - (1i*sign_t) * (omega^3) * (rho_f^2) .* Bu_z;
+
+    % Displacement block
+    y1 = - (omega^2) * rho_eff .* u1 - div1 + su_alpha1 + su_bp1 + mass_Bu1;
+    y2 = - (omega^2) * rho_eff .* u2 - div2 + su_alpha2 + su_bp2 + mass_Bu2;
+
+    % Pressure block: (i sign_t ω) p/M + (i sign_t) η_p p - div( B ∇p )
+    Vxk = fft2(vx_bp); Vzk = fft2(vz_bp);
+    div_Bgradp = ifft2(1i*KX .* Vxk + 1i*KZ .* Vzk);
+    mass_p = (1i*sign_t) * omega * (p ./ max(Mfield, eps)) + (1i*sign_t) * eta_p .* p;
+
+    % Coupling s_p(u) = (i sign_t) ω div(α·u) + ω^2 ρ_f div(B·u)
+    Au_x = alpha.xx .* u1 + alpha.xz .* u2;
+    Au_z = alpha.xz .* u1 + alpha.zz .* u2;
+    AUk_x = fft2(Au_x); AUk_z = fft2(Au_z);
+    div_Au = ifft2(1i*KX .* AUk_x + 1i*KZ .* AUk_z);
+
+    BUk_x = fft2(Bu_x); BUk_z = fft2(Bu_z);
+    div_Bu = ifft2(1i*KX .* BUk_x + 1i*KZ .* BUk_z);
+
+    sp = (1i*sign_t) * omega * div_Au + (omega^2) * rho_f * div_Bu;
+
+    y3 = mass_p - div_Bgradp + sp;
+    y = [y1(:); y2(:); y3(:)];
+end
+
+function z = applyMinv_isoFFT_u(r, Nx, Nz, KX, KZ, KK2, omega, rho0_eff, lambda0, mu0, pack_u, unpack_u)
+% Isotropic elastic spectral preconditioner:
+% A_u(k) = -ω^2 ρ0 I + μ0 |k|^2 I + (λ0+μ0) k k^T
+    [r1, r2] = unpack_u(r);
+    R1 = fft2(r1); R2 = fft2(r2);
+    kx = KX; kz = KZ; k2 = KK2;
+    a = - (omega^2) * rho0_eff + mu0 * k2;
+    b = (lambda0 + mu0);
+    tiny = (1e-14)*(1+1i);
+    a_safe = a; a_safe(abs(a_safe) < 1e-14) = a_safe(abs(a_safe) < 1e-14) + tiny;
+    Rdot = kx .* R1 + kz .* R2;
+    denom = a_safe .* (a_safe + b * k2);
+    denom(abs(denom) < 1e-14) = denom(abs(denom) < 1e-14) + tiny;
+    coef = b ./ denom;
+    Z1_hat = (R1 ./ a_safe) - coef .* kx .* Rdot;
+    Z2_hat = (R2 ./ a_safe) - coef .* kz .* Rdot;
+    z1 = ifft2(Z1_hat);
+    z2 = ifft2(Z2_hat);
+    z  = [z1(:); z2(:)];
+end
+
+function z_vec = applyMinv_pressure_isoFFT(r_vec, Nx, Nz, KX, KZ, M0, B0xx, B0zz, B0xz, ...
+                                           omega, sign_t, eta_p0, eps_shift)
+% Pressure spectral preconditioner:
+% A_p0(k) = i sign_t ω / M0 + k^T B0 k + i sign_t η_p0
+    r = reshape(r_vec, Nx, Nz);
+    Rk = fft2(r);
+    kx = KX; kz = KZ;
+    symB = B0xx.*(kx.^2) + 2*B0xz.*(kx.*kz) + B0zz.*(kz.^2);
+    sym0 = 1i*sign_t*omega/max(M0, eps) + symB + 1i*sign_t*eta_p0;
+    tiny = (1e-14) * (1+1i);
+    mask = (abs(sym0) < 1e-14);
+    sym0(mask) = sym0(mask) + tiny + eps_shift;
+    Zk = Rk ./ sym0;
+    z = ifft2(Zk);
+    z_vec = z(:);
+end
+
+function y = block_prec_apply(r_vec, Nx, Nz, Mprec_u, Mprec_p)
+% Applies block-diagonal preconditioner: diag(Mu^{-1}, Mp^{-1})
+    N = Nx*Nz;
+    r_u = r_vec(1:2*N);
+    r_p = r_vec(2*N+1:3*N);
+    z_u = Mprec_u(r_u);
+    z_p = Mprec_p(r_p);
+    y = [z_u; z_p];
+end
+
+function S = gaussian_point(Nx, Nz, sx, sz, sigma_cells)
+% Gaussian centered at (sx,sz). sigma_cells is the std in cells.
+    [Xg, Zg] = ndgrid(1:Nx, 1:Nz);
+    S = exp(- ((Xg - sx).^2 + (Zg - sz).^2) / (2*sigma_cells^2) );
+end
+
+function [KX, KZ] = build_k_grids(Nx, Nz, dx, dz)
+% Periodic wavenumber grids (MATLAB FFT ordering)
+    kx_vec = (2*pi/(Nx*dx)) * [0:ceil(Nx/2)-1, -floor(Nx/2):-1];
+    kz_vec = (2*pi/(Nz*dz)) * [0:ceil(Nz/2)-1, -floor(Nz/2):-1];
+    [KX, KZ] = ndgrid(kx_vec, kz_vec);
+end
+
+function [eta, tau] = build_sponge_quadratic_with_t(Nx, Nz, Lx, Lz, thickness_m)
+% Quadratic ABL profile (eta = tau.^2)
+    x = (0:Nx-1) * (Lx/Nx);
+    z = (0:Nz-1) * (Lz/Nz);
+    [Xg, Zg] = ndgrid(x, z);
+    d_left = Xg; d_right = Lx - Xg; d_top = Zg; d_bottom = Lz - Zg;
+    dmin = min(min(d_left, d_right), min(d_top, d_bottom));
+    tau = max(0, min(1, (thickness_m - dmin) / max(thickness_m, eps)));
+    eta = tau.^2;
+end
+
+function [c11,c33,c55,c13] = thomsen_to_stiffness(rho,Vp0,Vs0,epsilon,delta,~)
+% Thomsen (VTI) to stiffness: c11,c33,c55,c13 (Voigt)
+    A = rho*Vp0^2*(1 + 2*epsilon);
+    C = rho*Vp0^2;
+    L = rho*Vs0^2;
+    CL = C - L;
+    F = -L + sqrt(max(CL.*(CL + 2*C*delta), 0));
+    c11 = A; c33 = C; c55 = L; c13 = F;
+end
+
+function n_odd = make_odd(n)
+% Ensure odd integer >= 3
+    n_odd = max(3, n + mod(n+1,2));
+end
+
+function y = ricker_time(f0, t, t0)
+% Ricker wavelet in time (unit amplitude)
+    tau = t - t0;
+    pi2 = (pi * f0 .* tau).^2;
+    y = (1 - 2*pi2) .* exp(-pi2);
+end
+
+function cmap = redblue()
+% Red-blue diverging colormap
+    n = 256;
+    r = [linspace(0,1,128), ones(1,128)];
+    g = [linspace(0,1,128), linspace(1,0,128)];
+    b = [ones(1,128), linspace(1,0,128)];
+    cmap = [r(:), g(:), b(:)];
+end
